@@ -1,7 +1,6 @@
--- RTHelper UI Build (single-file)
--- FAST + RELIABLE: auto-seat, auto-take-orders, auto-start cook, auto-cook (ALL remotes),
--- auto-serve to correct customer, auto-collect bills & dishes (TaskCompleted),
--- Anti-AFK, flexible UI adapter (Window/CreateWindow/New/callable).
+-- RTHelper (single-file, no return)
+-- Auto-seat & take orders, auto-start cook, full cook-step spam, robust plate pickup,
+-- always-serve (queues + live scan), bills & dishes, Anti-AFK, single-tab UI.
 
 --!strict
 local Players           = game:GetService("Players")
@@ -11,9 +10,7 @@ local Workspace         = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 local DEBUG = false
 
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║                                Utils                                 ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ───────────────── helpers
 local function path(parent: Instance, ...): Instance
 	local cur = parent
 	for _, name in ipairs({...}) do cur = cur:WaitForChild(name) end
@@ -29,10 +26,9 @@ end
 local function parseTableIndex(name: string): number
 	return tonumber(string.match(name, "^T(%d+)$") or string.match(name, "^T(%d+)")) or math.huge
 end
+local function now() return os.clock() end
 
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║                          Game Module Requires                        ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ───────────────── game modules
 local FurnitureUtility       = safeRequire(path(ReplicatedStorage, "Source", "Utility", "FurnitureUtility"))
 local TableConnectionUtility = safeRequire(path(ReplicatedStorage, "Source", "Utility", "Furniture", "TableConnectionUtility"))
 local Customers              = safeRequire(path(LocalPlayer:WaitForChild("PlayerScripts"), "Source", "Systems", "Restaurant", "Customers"))
@@ -40,24 +36,15 @@ local CustomerState          = safeRequire(path(ReplicatedStorage, "Source", "En
 local Cook                   = safeRequire(path(LocalPlayer.PlayerScripts, "Source", "Systems", "Cook"))
 local CookReplication        = safeRequire(path(ReplicatedStorage, "Source", "Enums", "Cook", "CookReplication"))
 local TaskEnum               = safeRequire(path(ReplicatedStorage, "Source", "Enums", "Restaurant", "Task"))
+assert(FurnitureUtility and TableConnectionUtility and Customers and CustomerState and Cook and CookReplication and TaskEnum, "require() failed for core modules")
 
-assert(FurnitureUtility, "require(FurnitureUtility) failed")
-assert(TableConnectionUtility, "require(TableConnectionUtility) failed")
-assert(Customers, "require(Customers) failed")
-assert(CustomerState, "require(CustomerState) failed")
-assert(Cook, "require(Cook) failed")
-assert(CookReplication, "require(CookReplication) failed")
-assert(TaskEnum, "require(Task) failed")
-
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║                               Tycoon                                 ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ───────────────── tycoon
 local function waitTycoonOV(timeout: number?): Instance?
-	local deadline = os.clock() + (timeout or 5)
+	local deadline = now() + (timeout or 5)
 	local ov = LocalPlayer:FindFirstChild("Tycoon") or LocalPlayer:WaitForChild("Tycoon", timeout or 5)
 	if not (ov and ov:IsA("ObjectValue")) then return nil end
 	if ov.Value then return ov.Value end
-	while os.clock() < deadline and ov.Value == nil do task.wait(0.1) end
+	while now() < deadline and ov.Value == nil do task.wait(0.1) end
 	return ov.Value
 end
 local function resolveTycoon(): Instance
@@ -73,9 +60,7 @@ local function resolveTycoon(): Instance
 	return path(Workspace, "Tycoons", "Tycoon")
 end
 
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║                                Types                                 ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ───────────────── types
 type TableSendArgs = { GroupId: string, Tycoon: Instance, Name: "SendToTable", FurnitureModel: Instance }
 type ServeArgs     = { Name: "Serve", GroupId: string, Tycoon: Instance, FoodModel: Instance, CustomerId: string }
 type TakeOrderArgs = { Name: "TakeOrder", GroupId: string, Tycoon: Instance, CustomerId: string }
@@ -94,16 +79,16 @@ function RTHelper.new(tycoon: Instance?)
 	local self = setmetatable({}, RTHelper)
 
 	-- Remotes
-	local Events           = path(ReplicatedStorage, "Events")
-	local Restaurant       = path(Events, "Restaurant")
-	self.TaskCompleted     = path(Restaurant, "TaskCompleted") :: RemoteEvent
-	self.GrabFoodRF        = path(Restaurant, "GrabFood") :: RemoteFunction
-	self.Interacted        = path(Restaurant, "Interactions", "Interacted") :: RemoteEvent
+	local Events            = path(ReplicatedStorage, "Events")
+	local Restaurant        = path(Events, "Restaurant")
+	self.TaskCompleted      = path(Restaurant, "TaskCompleted") :: RemoteEvent
+	self.GrabFoodRF         = path(Restaurant, "GrabFood") :: RemoteFunction
+	self.Interacted         = path(Restaurant, "Interactions", "Interacted") :: RemoteEvent
 
 	-- Cook remotes
-	local CookEvents       = path(Events, "Cook")
-	self.CookInputRequested= path(CookEvents, "CookInputRequested") :: RemoteEvent
-	self.CookUpdated       = path(CookEvents, "CookUpdated") :: RemoteEvent
+	local CookEvents        = path(Events, "Cook")
+	self.CookInputRequested = path(CookEvents, "CookInputRequested") :: RemoteEvent
+	self.CookUpdated        = path(CookEvents, "CookUpdated") :: RemoteEvent
 
 	-- Tycoon + roots
 	self.Tycoon     = tycoon or resolveTycoon()
@@ -120,47 +105,47 @@ function RTHelper.new(tycoon: Instance?)
 	}
 
 	-- Runtime state
-	self._serveQueue    = {} :: { {gid: string, cid: string} }
-	self._lastFoodModel = nil :: Instance?
-	self._cookActive    = false
+	self._cookActive     = false
+	self._cookBeatAt     = 0.0
+	self._serveBusy      = false
+	self._foodInHand     = nil :: Instance?
 
-	-- per-table + per-group cooldowns
-	self._dishCooldown  = {} :: {[Model]: number}
-	self._billCooldown  = {} :: {[Model]: number}
-	self._seatCooldown  = {} :: {[string]: number} -- groupId -> last seat try
+	-- queues + de-dup
+	self._serveQueue     = {} :: { {gid: string, cid: string} }  -- “WaitingForDish”
+	self._orderQueue     = {} :: { {gid: string, cid: string} }  -- fallback targets after TakeOrder
+	self._serveSet       = {} :: {[string]: boolean}
+	self._orderSet       = {} :: {[string]: boolean}
 
-	-- control flags for loops
-	self.flags = {
-		autoSeatOrder = true,
-		autoCook      = true,
-		housekeeping  = true,
-	}
+	-- cooldowns
+	self._dishCooldown   = {} :: {[Model]: number}
+	self._billCooldown   = {} :: {[Model]: number}
+	self._seatCooldown   = {} :: {[string]: number}
+	self._orderCooldown  = {} :: {[string]: number}
+
+	-- control
+	self.flags = { autoSeatOrder = true, autoCook = true, housekeeping = true }
 	self.tuners = {
 		seatPeriod    = 0.35,
-		cookPeriod    = 0.75,
+		cookPeriod    = 0.6,
 		housePeriod   = 0.6,
 		housePerTick  = 10,
+		serveRetries  = 10,
+		serveDelay    = 0.18,
+		cookStallSec  = 6.0,
+		plateWaitSec  = 2.5
 	}
 
 	-- stats
-	self.stats = {
-		ordersTaken  = 0,
-		groupsSeated = 0,
-		served       = 0,
-		dishes       = 0,
-		bills        = 0,
-		cookStarts   = 0,
-	}
+	self.stats = { ordersTaken=0, groupsSeated=0, served=0, dishes=0, bills=0, cookStarts=0, stallsFixed=0 }
 
 	self:_bindSurfaceWatcher()
-	self:_bindFoodWatcher()
 	self:_bindCustomerEvents()
 	self:_bindCookEvents()
 
-	if DEBUG then print("[RTHelper] Tycoon:", self.Tycoon:GetFullName()) end
 	return self
 end
 
+-- ───────── surface watch
 function RTHelper:_bindSurfaceWatcher()
 	local function dirty() self._tablesDirty = true end
 	self.Surface.ChildAdded:Connect(function(ch)
@@ -179,14 +164,35 @@ function RTHelper:_bindSurfaceWatcher()
 	end
 end
 
-function RTHelper:_bindFoodWatcher()
-	self.FoodFolder.ChildAdded:Connect(function(ch)
-		self._lastFoodModel = ch
-		if DEBUG then print("[RTHelper] Food ready:", ch.Name) end
-	end)
+-- ───────── customers
+local function keyFor(gid: string, cid: string) return gid .. "|" .. cid end
+
+function RTHelper:_queueServe(gid: string, cid: string)
+	local k = keyFor(gid, cid)
+	if not self._serveSet[k] then
+		table.insert(self._serveQueue, {gid = gid, cid = cid})
+		self._serveSet[k] = true
+	end
+end
+function RTHelper:_queueOrder(gid: string, cid: string)
+	local k = keyFor(gid, cid)
+	if not self._orderSet[k] then
+		table.insert(self._orderQueue, {gid = gid, cid = cid})
+		self._orderSet[k] = true
+	end
 end
 
--- customer events -> queue serves
+function RTHelper:GetCustomerState(gid: string | number, cid: string | number)
+	local ok, st = pcall(Customers.GetCustomerState, Customers, self.Tycoon, toStringId(gid), toStringId(cid))
+	if ok then return st end
+	return nil
+end
+function RTHelper:GetGroupState(gid: string | number)
+	local ok, st = pcall(Customers.GetGroupState, Customers, self.Tycoon, toStringId(gid))
+	if ok then return st end
+	return nil
+end
+
 function RTHelper:_bindCustomerEvents()
 	if Customers.CustomerStateChanged then
 		Customers.CustomerStateChanged:Connect(function(...)
@@ -196,39 +202,44 @@ function RTHelper:_bindCustomerEvents()
 			local cid    = toStringId(a[3])
 			local state  = a[5] or a[#a]
 			if state == CustomerState.WaitingForDish then
-				table.insert(self._serveQueue, { gid = gid, cid = cid })
-				if DEBUG then print("[RTHelper] queued serve:", gid, cid) end
+				self:_queueServe(gid, cid)
 			end
 		end)
 	end
 end
 
--- cooking spammer
+-- ───────── cooking
+function RTHelper:_beat() self._cookBeatAt = now() end
 function RTHelper:_cookInteract(model: Instance, itemType: any)
-	self.CookInputRequested:FireServer(CookReplication.Interact, model, itemType)
+	self:_beat(); self.CookInputRequested:FireServer(CookReplication.Interact, model, itemType)
 end
 function RTHelper:_cookComplete(model: Instance?, itemType: any, instrKey: any?)
-	self.CookInputRequested:FireServer(CookReplication.CompleteTask, model, itemType)
+	self:_beat(); self.CookInputRequested:FireServer(CookReplication.CompleteTask, model, itemType)
 	if instrKey ~= nil then
-		self.CookInputRequested:FireServer(CookReplication.CompleteTask, itemType, instrKey, false)
+		self:_beat(); self.CookInputRequested:FireServer(CookReplication.CompleteTask, itemType, instrKey, false)
 	end
 end
 function RTHelper:_bindCookEvents()
 	if Cook.Started then
 		Cook.Started:Connect(function(ty)
-			if ty == self.Tycoon then self._cookActive = true; self.stats.cookStarts += 1 end
+			if ty == self.Tycoon then
+				self._cookActive = true
+				self:_beat()
+				self.stats.cookStarts += 1
+			end
 		end)
 	end
 	if Cook.Finished then
 		Cook.Finished:Connect(function(ty)
 			if ty == self.Tycoon then
 				self._cookActive = false
-				task.defer(function() self:GrabFoodAndServeNext() end)
+				self:_beat()
+				task.defer(function() self:ServeIfPossible() end)
 			end
 		end)
 	end
-
 	self.CookUpdated.OnClientEvent:Connect(function(op, ...)
+		self:_beat()
 		local a = { ... }
 		if op == CookReplication.DirectToEquipment then
 			local ty, model, itemType, key = a[1], a[2], a[3], a[4]
@@ -236,37 +247,58 @@ function RTHelper:_bindCookEvents()
 			self._cookActive = true
 			self:_cookInteract(model, itemType)
 			self:_cookComplete(model, itemType, key)
-
 		elseif op == CookReplication.UpdateInteraction then
 			local ty, model, itemType, key = a[1], a[2], a[3], a[4]
 			if ty ~= self.Tycoon then return end
 			self:_cookComplete(model, itemType, key)
-
 		elseif op == CookReplication.Start then
 			self._cookActive = true
-
 		elseif op == CookReplication.Finish then
 			self._cookActive = false
-			task.defer(function() self:GrabFoodAndServeNext() end)
+			task.defer(function() self:ServeIfPossible() end)
 		end
 	end)
-
 	if Cook.StateUpdated then
 		Cook.StateUpdated:Connect(function(state)
 			if not state then return end
+			self:_beat()
 			self:_cookComplete(nil, nil, state.InstructionKey)
 		end)
 	end
 end
 
--- start cooking (order counter)
-function RTHelper:PressOrderCounter()
-	local counters = FurnitureUtility:FindWhere(self.Tycoon, self.Surface, function(inst)
-		return FurnitureUtility:Is(inst, FurnitureUtility.ItemType.OrderCounter)
+-- ───────── order counter (robust)
+function RTHelper:_findOrderCounter(): Instance?
+	-- 1) game utility
+	local list = {}
+	local ok, res = pcall(FurnitureUtility.FindWhere, FurnitureUtility, self.Tycoon, self.Surface, function(inst)
+		local ok2, isOC = pcall(FurnitureUtility.Is, FurnitureUtility, inst, FurnitureUtility.ItemType.OrderCounter)
+		return ok2 and isOC
 	end)
-	if #counters == 0 then return false end
-	local counter = counters[1]
+	if ok and type(res) == "table" and #res > 0 then return res[1] end
 
+	-- 2) heuristic: any descendant named/typed like order counter
+	for _, d in ipairs(self.Surface:GetDescendants()) do
+		if d:IsA("Model") then
+			if d.Name:lower():find("order") or d.Name:lower():find("counter") then
+				return d
+			end
+			for _, pp in ipairs(d:GetDescendants()) do
+				if pp:IsA("ProximityPrompt") then
+					local t = ((pp.ObjectText or "") .. " " .. (pp.ActionText or "")):lower()
+					if t:find("order") or t:find("cook") then return d end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+function RTHelper:PressOrderCounter(): boolean
+	local counter = self:_findOrderCounter()
+	if not counter then return false end
+
+	-- prefer proximity prompt
 	local prompt: ProximityPrompt?
 	for _, d in ipairs(counter:GetDescendants()) do
 		if d:IsA("ProximityPrompt") then prompt = d break end
@@ -276,6 +308,8 @@ function RTHelper:PressOrderCounter()
 		pcall(fpp, prompt)
 		return true
 	end
+
+	-- remote fallback
 	local base = counter:FindFirstChildOfClass("BasePart") or counter:FindFirstChild("Base")
 	if base and base:IsA("BasePart") then
 		local details = {
@@ -289,28 +323,94 @@ function RTHelper:PressOrderCounter()
 	return false
 end
 
--- after cook -> grab & serve next queued
-function RTHelper:GrabFoodAndServeNext()
-	local food = self._lastFoodModel
-	if not (food and food.Parent == self.FoodFolder) then
-		local kids = self.FoodFolder:GetChildren()
-		table.sort(kids, function(a,b) return a.Name > b.Name end)
-		food = kids[1]
+-- ───────── seating + orders
+function RTHelper:_iterSpeechUIs()
+	local out = {}
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not pg then return out end
+	for _, gui in ipairs(pg:GetChildren()) do
+		if gui:IsA("BillboardGui") and gui.Name == "CustomerSpeechUI" and gui.Adornee then
+			local head = gui.Adornee
+			local char = head.Parent
+			local group = char and char.Parent
+			if char and group then table.insert(out, {char=char, group=group}) end
+		end
 	end
-	if not food then return end
-
-	local nextServe = table.remove(self._serveQueue, 1)
-	if not nextServe then return end
-
-	pcall(function() self.GrabFoodRF:InvokeServer(food) end)
-	local args: {ServeArgs} = { {
-		Name = TaskEnum.Serve, GroupId = nextServe.gid, Tycoon = self.Tycoon, FoodModel = food, CustomerId = nextServe.cid
-	} }
-	self.TaskCompleted:FireServer(unpack(args))
-	self.stats.served += 1
+	return out
+end
+function RTHelper:_extractIds(group: Instance, char: Instance): (string, string)
+	local gid = group:GetAttribute("GroupId") or group:GetAttribute("Id") or group.Name
+	local cid = char:GetAttribute("CustomerId") or char:GetAttribute("Id") or char.Name
+	return toStringId(gid), toStringId(cid)
 end
 
--- tables
+function RTHelper:HandleSpeechPrompts()
+	self:_ensureTables()
+	local prompts = self:_iterSpeechUIs()
+
+	local groups: {[string]: {group: Instance, unseated: number, anyOrdering: boolean, gstate: any}} = {}
+	local orders = {}
+
+	for _, p in ipairs(prompts) do
+		local gid, cid = self:_extractIds(p.group, p.char)
+		local st = self:GetCustomerState(gid, cid)
+		if st == CustomerState.Ordering then table.insert(orders, {gid=gid, cid=cid}) end
+
+		local g = groups[gid]
+		if not g then g = { group=p.group, unseated=0, anyOrdering=false, gstate=self:GetGroupState(gid) }; groups[gid]=g end
+		if st == CustomerState.Ordering then g.anyOrdering = true end
+
+		-- seated check via seat occupants
+		local hum = p.char:FindFirstChildOfClass("Humanoid")
+		local seated = false
+		if hum then
+			for _, tbl in ipairs(self._tableList) do
+				local md = self._tableMeta[tbl]
+				for _, seat in ipairs(md.chairList) do
+					if (seat:IsA("Seat") or seat:IsA("VehicleSeat")) and seat.Occupant == hum then seated = true; break end
+				end
+				if seated then break end
+			end
+		end
+		if not seated then g.unseated += 1 end
+	end
+
+	-- take orders (debounced)
+	local tnow = now()
+	for _, o in ipairs(orders) do
+		local k = keyFor(o.gid, o.cid)
+		local last = self._orderCooldown[k] or 0
+		if (tnow - last) >= 0.9 then
+			local args: {TakeOrderArgs} = { { Name = TaskEnum.TakeOrder, GroupId = o.gid, Tycoon = self.Tycoon, CustomerId = o.cid } }
+			self.TaskCompleted:FireServer(unpack(args))
+			self._orderCooldown[k] = tnow
+			self.stats.ordersTaken += 1
+			self:_queueOrder(o.gid, o.cid)
+		end
+	end
+
+	-- seat only truly unseated groups not already going/ordering
+	for gid, g in pairs(groups) do
+		if g.unseated > 0 and not g.anyOrdering then
+			local gs = g.gstate
+			local goingOrSeated = (gs == CustomerState.GoingToTable) or (gs == CustomerState.Seated) or (gs == CustomerState.WaitingForDish)
+			if not goingOrSeated then
+				local last = self._seatCooldown[gid] or 0
+				if (tnow - last) >= 1.5 then
+					local tbl = self:GetTableForGroup(g.group)
+					if tbl then
+						local args: {TableSendArgs} = { { GroupId = gid, Tycoon = self.Tycoon, Name = TaskEnum.SendToTable, FurnitureModel = tbl } }
+						self.TaskCompleted:FireServer(unpack(args))
+						self.stats.groupsSeated += 1
+					end
+					self._seatCooldown[gid] = tnow
+				end
+			end
+		end
+	end
+end
+
+-- ───────── table discovery
 local function _findTables(self): {Model}
 	local found = {}
 	local ok, list = pcall(FurnitureUtility.FindWhere, FurnitureUtility, self.Tycoon, self.Surface, function(inst)
@@ -318,9 +418,7 @@ local function _findTables(self): {Model}
 		return ok2 and isTable
 	end)
 	if ok and type(list) == "table" then
-		for _, v in ipairs(list) do
-			if typeof(v) == "Instance" and v:IsA("Model") then table.insert(found, v) end
-		end
+		for _, v in ipairs(list) do if typeof(v) == "Instance" and v:IsA("Model") then table.insert(found, v) end end
 	end
 	if #found == 0 then
 		for _, d in ipairs(self.Surface:GetDescendants()) do
@@ -334,7 +432,6 @@ local function _findTables(self): {Model}
 	end
 	return found
 end
-
 function RTHelper:_rebuildTableCache()
 	local list = {} :: {Model}
 	local meta = {} :: {[Model]: { idx: number, seats: number, chairList: {Instance}, inUse: boolean, plateAdornee: Instance? }}
@@ -364,13 +461,11 @@ function RTHelper:_rebuildTableCache()
 
 	self._tableList, self._tableMeta, self._tablesDirty = list, meta, false
 end
-
 function RTHelper:_ensureTables()
 	if self._tablesDirty or #self._tableList == 0 then
 		self:_rebuildTableCache()
 	end
 end
-
 function RTHelper:GetAllTables(): {Model}
 	self:_ensureTables(); return self._tableList
 end
@@ -379,9 +474,7 @@ function RTHelper:GetAvailableTables(): {Model}
 	local out = {}
 	for _, m in ipairs(self._tableList) do
 		local md = self._tableMeta[m]
-		if md.plateAdornee and (not md.inUse) and md.seats > 0 then
-			table.insert(out, m)
-		end
+		if md.plateAdornee and (not md.inUse) and md.seats > 0 then table.insert(out, m) end
 	end
 	return out
 end
@@ -411,117 +504,106 @@ function RTHelper:GetTableForGroup(group: Instance | number): Model?
 	return best
 end
 
--- group + orders
-function RTHelper:_iterSpeechUIs()
-	local pg = LocalPlayer.PlayerGui
-	local out = {}
-	if not pg then return out end
+-- ───────── serving
+function RTHelper:_getNewestFoodOnCounter(): Instance?
+	local kids = self.FoodFolder:GetChildren()
+	if #kids == 0 then return nil end
+	table.sort(kids, function(a,b) return a.Name > b.Name end)
+	return kids[1]
+end
+function RTHelper:_isServeConfirmed(gid: string, cid: string, food: Instance?): boolean
+	local st = self:GetCustomerState(gid, cid)
+	if st and st ~= CustomerState.WaitingForDish then return true end
+	if not food or food.Parent == nil then return true end
+	return false
+end
+function RTHelper:_scanWaitingFallback(): (string?, string?)
+	-- actively discover anyone WaitingForDish (if we missed events)
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not pg then return nil, nil end
 	for _, gui in ipairs(pg:GetChildren()) do
 		if gui:IsA("BillboardGui") and gui.Name == "CustomerSpeechUI" and gui.Adornee then
-			local head = gui.Adornee
-			local char = head.Parent
+			local char = gui.Adornee.Parent
 			local group = char and char.Parent
 			if char and group then
-				table.insert(out, {head = head, char = char, group = group})
+				local gid, cid = self:_extractIds(group, char)
+				local st = self:GetCustomerState(gid, cid)
+				if st == CustomerState.WaitingForDish then return gid, cid end
 			end
 		end
 	end
-	return out
+	return nil, nil
 end
-function RTHelper:_extractIds(group: Instance, char: Instance): (string, string)
-	local gid = group:GetAttribute("GroupId") or group:GetAttribute("Id") or group.Name
-	local cid = char:GetAttribute("CustomerId") or char:GetAttribute("Id") or char.Name
-	return toStringId(gid), toStringId(cid)
-end
-function RTHelper:GetCustomerState(groupId: string | number, customerId: string | number)
-	local ok, state = pcall(Customers.GetCustomerState, Customers, self.Tycoon, toStringId(groupId), toStringId(customerId))
-	if ok then return state end
-	return nil
-end
-function RTHelper:GetGroupState(groupId: string | number)
-	local ok, state = pcall(Customers.GetGroupState, Customers, self.Tycoon, toStringId(groupId))
-	if ok then return state end
-	return nil
-end
-function RTHelper:IsDummySeated(char: Instance): (boolean, Model?)
-	self:_ensureTables()
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	if not hum then return false, nil end
-	for _, tbl in ipairs(self._tableList) do
-		local md = self._tableMeta[tbl]
-		for _, seat in ipairs(md.chairList) do
-			if (seat:IsA("Seat") or seat:IsA("VehicleSeat")) and seat.Occupant == hum then
-				return true, tbl
-			end
+function RTHelper:_pickTarget(): (string?, string?)
+	if #self._serveQueue > 0 then
+		local rec = table.remove(self._serveQueue, 1)
+		self._serveSet[keyFor(rec.gid, rec.cid)] = nil
+		return rec.gid, rec.cid
+	end
+	-- upgrade any ordered customer who is now waiting
+	for i = 1, #self._orderQueue do
+		local rec = self._orderQueue[i]
+		if self:GetCustomerState(rec.gid, rec.cid) == CustomerState.WaitingForDish then
+			table.remove(self._orderQueue, i)
+			self._orderSet[keyFor(rec.gid, rec.cid)] = nil
+			return rec.gid, rec.cid
 		end
 	end
-	return false, nil
+	-- live scan fallback
+	return self:_scanWaitingFallback()
 end
 
--- seat/order with strict gating + correct stats
-function RTHelper:HandleSpeechPrompts()
-	local prompts = self:_iterSpeechUIs()
+function RTHelper:_grabAndServe(gid: string, cid: string)
+	if self._serveBusy then return end
+	self._serveBusy = true
 
-	-- gather per group
-	local groups: {[string]: {group: Instance, unseated: number, anyOrdering: boolean, gstate: any}} = {}
-	local orders = {}  -- { {gid, cid} }
-
-	for _, p in ipairs(prompts) do
-		local gid, cid = self:_extractIds(p.group, p.char)
-		local state = self:GetCustomerState(gid, cid)
-
-		-- seated customers asking to order
-		if state == CustomerState.Ordering then
-			table.insert(orders, {gid = gid, cid = cid})
-		end
-
-		-- init group bucket
-		local g = groups[gid]
-		if not g then
-			g = { group = p.group, unseated = 0, anyOrdering = false, gstate = self:GetGroupState(gid) }
-			groups[gid] = g
-		end
-		if state == CustomerState.Ordering then g.anyOrdering = true end
-
-		-- per-dummy seating
-		local isSeated = select(1, self:IsDummySeated(p.char))
-		if not isSeated then g.unseated += 1 end
+	-- wait for plate to appear (after finish)
+	local deadline = now() + self.tuners.plateWaitSec
+	local food = self:_getNewestFoodOnCounter()
+	while not food and now() < deadline do
+		task.wait(0.05)
+		food = self:_getNewestFoodOnCounter()
+	end
+	if not food then
+		self._serveBusy = false
+		return
 	end
 
-	-- Take orders first
-	for _, o in ipairs(orders) do
-		self:TakeOrder(o.cid, o.gid)
-		self.stats.ordersTaken += 1
+	local okGrab, res = pcall(function() return self.GrabFoodRF:InvokeServer(food) end)
+	if not okGrab then
+		if DEBUG then warn("[RTHelper] GrabFood failed:", res) end
+		self._serveBusy = false
+		return
+	end
+	self._foodInHand = food
+
+	-- retries
+	local served = false
+	for _ = 1, self.tuners.serveRetries do
+		local args: {ServeArgs} = { { Name = TaskEnum.Serve, GroupId = gid, Tycoon = self.Tycoon, FoodModel = food, CustomerId = cid } }
+		self.TaskCompleted:FireServer(unpack(args))
+		task.wait(self.tuners.serveDelay)
+		if self:_isServeConfirmed(gid, cid, food) then served = true; break end
 	end
 
-	-- Seat only true waiting groups (cooldown + state checks)
-	local now = os.clock()
-	for gid, g in pairs(groups) do
-		if g.unseated > 0 and not g.anyOrdering then
-			local gs = g.gstate
-			local goingOrSeated =
-				(gs == CustomerState.GoingToTable) or
-				(gs == CustomerState.Seated) or
-				(gs == CustomerState.WaitingForDish)
-
-			if not goingOrSeated then
-				local last = self._seatCooldown[gid] or 0
-				if (now - last) >= 1.5 then
-					local tbl = self:GetTableForGroup(g.group)
-					if tbl then
-						self:SendToTable(gid, tbl)
-						self.stats.groupsSeated += 1 -- count only when we actually seat
-						self._seatCooldown[gid] = now
-					else
-						self._seatCooldown[gid] = now -- backoff when no table
-					end
-				end
-			end
-		end
+	if served then
+		self.stats.served += 1
+		self._foodInHand = nil
+	else
+		-- push back to queue; we’ll try again shortly
+		self:_queueServe(gid, cid)
 	end
+	self._serveBusy = false
 end
 
--- bills + dishes via TaskCompleted
+function RTHelper:ServeIfPossible()
+	if self._serveBusy then return end
+	local gid, cid = self:_pickTarget()
+	if not gid then return end
+	self:_grabAndServe(gid, cid)
+end
+
+-- ───────── bills + dishes (TaskCompleted path)
 function RTHelper:_canCollectDishes(tbl: Model): boolean
 	return tbl:FindFirstChild("Trash") ~= nil
 end
@@ -530,95 +612,107 @@ function RTHelper:_canCollectBill(tbl: Model): boolean
 	return bill ~= nil and (bill:GetAttribute("Taken") ~= true)
 end
 function RTHelper:_collectDishes(tbl: Model)
-	self.TaskCompleted:FireServer({
-		Name = TaskEnum.CollectDishes;
-		FurnitureModel = tbl;
-		Tycoon = self.Tycoon;
-	})
+	self.TaskCompleted:FireServer({ Name = TaskEnum.CollectDishes; FurnitureModel = tbl; Tycoon = self.Tycoon; })
 	self.stats.dishes += 1
 end
 function RTHelper:_collectBill(tbl: Model)
-	self.TaskCompleted:FireServer({
-		Name = TaskEnum.CollectBill;
-		FurnitureModel = tbl;
-		Tycoon = self.Tycoon;
-	})
+	self.TaskCompleted:FireServer({ Name = TaskEnum.CollectBill; FurnitureModel = tbl; Tycoon = self.Tycoon; })
 	self.stats.bills += 1
 end
 function RTHelper:SweepBillsAndDishesOnce(maxActions: number?)
 	self:_ensureTables()
-	local now = os.clock()
+	local tnow = now()
 	local left = maxActions or 8
-
 	for _, tbl in ipairs(self._tableList) do
 		if left <= 0 then break end
-
 		if self:_canCollectDishes(tbl) then
 			local last = self._dishCooldown[tbl] or 0
-			if now - last >= 0.55 then
-				self._dishCooldown[tbl] = now
+			if (tnow - last) >= 0.55 then
+				self._dishCooldown[tbl] = tnow
 				self:_collectDishes(tbl)
-				left -= 1
-				if left <= 0 then break end
+				left -= 1; if left <= 0 then break end
 			end
 		end
-
 		if self:_canCollectBill(tbl) then
 			local last = self._billCooldown[tbl] or 0
-			if now - last >= 1.05 then
-				self._billCooldown[tbl] = now
+			if (tnow - last) >= 1.05 then
+				self._billCooldown[tbl] = tnow
 				self:_collectBill(tbl)
-				left -= 1
-				if left <= 0 then break end
+				left -= 1; if left <= 0 then break end
 			end
 		end
 	end
 end
 
--- remotes
-function RTHelper:SendToTable(groupId: string | number, furnitureModel: Instance)
-	local args: {TableSendArgs} = { {
-		GroupId = toStringId(groupId), Tycoon = self.Tycoon, Name = TaskEnum.SendToTable, FurnitureModel = furnitureModel,
-	} }
-	self.TaskCompleted:FireServer(unpack(args))
-end
-function RTHelper:GrabFood(food: Instance | string | number)
-	local foodInstance: Instance
-	if typeof(food) == "Instance" then
-		foodInstance = food
-	else
-		foodInstance = path(self.Objects, "Food"):WaitForChild(toStringId(food))
+-- ───────── table cache
+function RTHelper:_rebuildTableCache()
+	local list = {} :: {Model}
+	local meta = {} :: {[Model]: { idx: number, seats: number, chairList: {Instance}, inUse: boolean, plateAdornee: Instance? }}
+
+	for _, tbl in ipairs((function(selfRef) -- local scope iterator
+		local found = {}
+		local ok, res = pcall(FurnitureUtility.FindWhere, FurnitureUtility, selfRef.Tycoon, selfRef.Surface, function(inst)
+			local ok2, isTable = pcall(FurnitureUtility.IsTable, FurnitureUtility, inst)
+			return ok2 and isTable
+		end)
+		if ok and type(res) == "table" then
+			for _, v in ipairs(res) do if typeof(v) == "Instance" and v:IsA("Model") then table.insert(found, v) end end
+		end
+		if #found == 0 then
+			for _, d in ipairs(selfRef.Surface:GetDescendants()) do
+				if d:IsA("Model") then
+					local base = d:FindFirstChild("Base")
+					if (d.Name:match("^T%d+") or (base and base:FindFirstChild("PlateHeight"))) then
+						table.insert(found, d)
+					end
+				end
+			end
+		end
+		return found
+	end)(self)) do
+		local base   = tbl:FindFirstChild("Base")
+		local plate  = base and base:FindFirstChild("PlateHeight")
+		local chairs = {}
+		local ok, linked = pcall(TableConnectionUtility.FindChairs, TableConnectionUtility, self.Tycoon, tbl)
+		if ok and type(linked) == "table" then chairs = linked end
+
+		table.insert(list, tbl)
+		meta[tbl] = {
+			idx          = parseTableIndex(tbl.Name),
+			seats        = #chairs,
+			chairList    = chairs,
+			inUse        = tbl:GetAttribute("InUse") == true,
+			plateAdornee = plate,
+		}
 	end
-	self.GrabFoodRF:InvokeServer(foodInstance)
+
+	table.sort(list, function(a, b)
+		local ia, ib = meta[a].idx, meta[b].idx
+		if ia ~= ib then return ia < ib end
+		return a.Name < b.Name
+	end)
+
+	self._tableList, self._tableMeta, self._tablesDirty = list, meta, false
 end
-function RTHelper:Serve(customerId: string | number, groupId: string | number?, foodModel: Instance?)
-	local args: {ServeArgs} = { {
-		Name = TaskEnum.Serve, GroupId = toStringId(groupId or "1"), Tycoon = self.Tycoon,
-		FoodModel = foodModel or Instance.new("Model"), CustomerId = toStringId(customerId),
-	} }
-	self.TaskCompleted:FireServer(unpack(args))
-	self.stats.served += 1
+function RTHelper:_ensureTables()
+	if self._tablesDirty or #self._tableList == 0 then self:_rebuildTableCache() end
 end
-function RTHelper:TakeOrder(customerId: string | number, groupId: string | number?)
-	local args: {TakeOrderArgs} = { {
-		Name = TaskEnum.TakeOrder, GroupId = toStringId(groupId or "2"), Tycoon = self.Tycoon, CustomerId = toStringId(customerId),
-	} }
-	self.TaskCompleted:FireServer(unpack(args))
-	self.stats.ordersTaken += 1
-end
-function RTHelper:Interact(details: InteractArgs, tycoonOverride: Instance?)
-	local tycoon = tycoonOverride or self.Tycoon
-	if typeof(details.WorldPosition) ~= "Vector3" then error("WorldPosition must be a Vector3") end
-	self.Interacted:FireServer(tycoon, details)
+function RTHelper:GetAllTables(): {Model} self:_ensureTables(); return self._tableList end
+function RTHelper:GetAvailableTables(): {Model}
+	self:_ensureTables()
+	local out = {}
+	for _, m in ipairs(self._tableList) do
+		local md = self._tableMeta[m]
+		if md.plateAdornee and (not md.inUse) and md.seats > 0 then table.insert(out, m) end
+	end
+	return out
 end
 
--- background loops (toggleable)
+-- ───────── loops (with watchdog & serve-first policy)
 function RTHelper:RunSeatOrderLoop()
 	task.spawn(function()
 		while true do
-			if self.flags.autoSeatOrder then
-				pcall(function() self:HandleSpeechPrompts() end)
-			end
+			if self.flags.autoSeatOrder then pcall(function() self:HandleSpeechPrompts() end) end
 			task.wait(self.tuners.seatPeriod)
 		end
 	end)
@@ -626,9 +720,21 @@ end
 function RTHelper:RunCookLoop()
 	task.spawn(function()
 		while true do
-			if self.flags.autoCook and not self._cookActive then
+			-- watchdog
+			if self._cookActive and (now() - self._cookBeatAt) > self.tuners.cookStallSec then
+				if DEBUG then warn("[RTHelper] cook stalled; forcing idle") end
+				self._cookActive = false
+				self.stats.stallsFixed += 1
+			end
+
+			-- serve first if we can
+			if not self._serveBusy then pcall(function() self:ServeIfPossible() end) end
+
+			-- start cooking aggressively (works even if there’s 0 orders; harmless)
+			if self.flags.autoCook and (not self._cookActive) and (not self._serveBusy) and (self._foodInHand == nil) then
 				pcall(function() self:PressOrderCounter() end)
 			end
+
 			task.wait(self.tuners.cookPeriod)
 		end
 	end)
@@ -636,17 +742,20 @@ end
 function RTHelper:RunHousekeepingLoop()
 	task.spawn(function()
 		while true do
-			if self.flags.housekeeping then
-				pcall(function() self:SweepBillsAndDishesOnce(self.tuners.housePerTick) end)
-			end
+			if self.flags.housekeeping then pcall(function() self:SweepBillsAndDishesOnce(self.tuners.housePerTick) end) end
 			task.wait(self.tuners.housePeriod)
 		end
 	end)
 end
 
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║                               Anti-AFK                               ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ───────── Interact passthrough (rarely needed)
+function RTHelper:Interact(details: InteractArgs, tycoonOverride: Instance?)
+	local tycoon = tycoonOverride or self.Tycoon
+	if typeof(details.WorldPosition) ~= "Vector3" then error("WorldPosition must be a Vector3") end
+	self.Interacted:FireServer(tycoon, details)
+end
+
+-- ───────── Anti-AFK
 local AntiAFK = { _conn = nil, enabled = false }
 function AntiAFK:set(state: boolean)
 	self.enabled = state
@@ -660,9 +769,7 @@ function AntiAFK:set(state: boolean)
 	end
 end
 
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║                              UI Adapter                              ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ───────── UI (single tab)
 local function loadUILib()
 	local URL = "https://raw.githubusercontent.com/ProtonDev-sys/the-return/refs/heads/main/ui%20library/ui%20library.lua"
 	local ok, lib = pcall(function() return loadstring(game:HttpGet(URL))() end)
@@ -671,52 +778,32 @@ local function loadUILib()
 	return nil
 end
 local function tryMakeWindow(lib, spec)
-	-- lib as a function?
-	if type(lib) == "function" then
-		local ok, win = pcall(lib, spec); if ok and type(win) == "table" then return win end
-	end
-	-- common ctors
-	local candidates = { "Window", "CreateWindow", "New", "new" }
-	for _, name in ipairs(candidates) do
-		local fn = (type(lib) == "table") and lib[name]
-		if type(fn) == "function" then
-			local ok, win = pcall(fn, lib, spec) -- method
-			if not ok then ok, win = pcall(fn, spec) end -- function
-			if ok and type(win) == "table" then return win end
+	if type(lib) == "function" then local ok, win = pcall(lib, spec); if ok and type(win)=="table" then return win end end
+	for _, name in ipairs({ "Window","CreateWindow","New","new" }) do
+		local fn = (type(lib)=="table") and lib[name]
+		if type(fn)=="function" then
+			local ok, win = pcall(fn, lib, spec); if not ok then ok, win = pcall(fn, spec) end
+			if ok and type(win)=="table" then return win end
 		end
 	end
 	return nil
 end
-local function tryMethod(obj, name, ...)
-	local fn = obj and obj[name]
-	if type(fn) == "function" then
-		local ok, a, b, c = pcall(fn, obj, ...)
-		if ok then return a, b, c end
-	end
-	return nil
-end
 local function addToggle(where, label, default, cb)
-	if where and type(where.Toggle) == "function" then
-		local t = where:Toggle(label, cb); if t and t.Set then t:Set(default) end; return
-	end
-	if where and type(where.AddToggle) == "function" then
-		where:AddToggle(label, default, cb); return
-	end
+	if where and type(where.Toggle)=="function" then local t=where:Toggle(label, cb); if t and t.Set then t:Set(default) end; return end
+	if where and type(where.AddToggle)=="function" then where:AddToggle(label, default, cb); return end
 	cb(default)
 end
 local function addSlider(where, label, min, max, default, cb)
-	if where and type(where.Slider) == "function" then where:Slider(label, min, max, default, cb); return end
-	if where and type(where.AddSlider) == "function" then where:AddSlider(label, min, max, default, cb); return end
+	if where and type(where.Slider)=="function" then where:Slider(label,min,max,default,cb); return end
+	if where and type(where.AddSlider)=="function" then where:AddSlider(label,min,max,default,cb); return end
 end
 local function addLabel(where, text)
-	if where and type(where.Label) == "function" then return where:Label(text) end
-	if where and type(where.AddLabel) == "function" then return where:AddLabel(text) end
+	if where and type(where.Label)=="function" then return where:Label(text) end
+	if where and type(where.AddLabel)=="function" then return where:AddLabel(text) end
 	return nil
 end
 
--- ╔══════════════════════════════════════════════════════════════════════╗
--- ║                               Boot / UI                              ║
--- ╚══════════════════════════════════════════════════════════════════════╝
+-- ───────── boot
 local rt = RTHelper.new()
 rt:RunSeatOrderLoop()
 rt:RunCookLoop()
@@ -725,55 +812,36 @@ AntiAFK:set(true)
 
 local UI = loadUILib()
 if UI then
-	local win = tryMakeWindow(UI, {
-		Title = "RT3 Helper",
-		CFG   = "RT3_HELPER_CFG",
-		Key   = Enum.KeyCode.RightShift,
-		External = { KeySystem = false }
-	})
-	if not win then
-		warn("[RTHelper] UI: couldn’t create window; running headless.")
-	else
-		-- layout: TSection -> Tab -> Section (fallbacks tolerant)
-		local autoSection = tryMethod(win, "TSection", "Automation") or win
-		local autoTab     = tryMethod(autoSection, "Tab", "Main")   or autoSection
-		local auto        = tryMethod(autoTab, "Section", "Toggles") or autoTab
+	local win = tryMakeWindow(UI, { Title="RT3 Helper", CFG="RT3_HELPER_CFG", Key=Enum.KeyCode.RightShift, External={KeySystem=false} })
+	if win then
+		local tab = (win.Tab and win:Tab("Automation")) or win
+		local sec = (tab.Section and tab:Section("Main")) or tab
 
-		local cookTab     = tryMethod(autoSection, "Tab", "Cooking") or autoSection
-		local cookSec     = tryMethod(cookTab, "Section", "Control") or cookTab
+		addToggle(sec, "Auto Seat & Take Orders", true, function(v) rt.flags.autoSeatOrder = v end)
+		addToggle(sec, "Auto Cook",               true, function(v) rt.flags.autoCook      = v end)
+		addToggle(sec, "Auto Bills + Dishes",     true, function(v) rt.flags.housekeeping  = v end)
+		addToggle(sec, "Anti-AFK",                true, function(v) AntiAFK:set(v) end)
 
-		local hkTab       = tryMethod(autoSection, "Tab", "Housekeeping") or autoSection
-		local hkSec       = tryMethod(hkTab, "Section", "Bills & Dishes") or hkTab
+		addSlider(sec, "Seat check (s)",  0.1,  1.0, rt.tuners.seatPeriod, function(v) rt.tuners.seatPeriod = tonumber(string.format("%.2f", v)) end)
+		addSlider(sec, "Cook check (s)",  0.25, 2.0, rt.tuners.cookPeriod, function(v) rt.tuners.cookPeriod = tonumber(string.format("%.2f", v)) end)
+		addSlider(sec, "Housekeep (s)",   0.2,  3.0, rt.tuners.housePeriod,function(v) rt.tuners.housePeriod= tonumber(string.format("%.2f", v)) end)
+		addSlider(sec, "Actions/tick",       1,   20, rt.tuners.housePerTick, function(v) rt.tuners.housePerTick = math.floor(v) end)
 
-		local miscSection = tryMethod(win, "TSection", "Misc") or win
-		local miscTab     = tryMethod(miscSection, "Tab", "Other") or miscSection
-		local misc        = tryMethod(miscTab, "Section", "Anti-AFK & Stats") or miscTab
-
-		-- toggles
-		addToggle(auto, "Auto Seat & Take Orders", true, function(state) rt.flags.autoSeatOrder = state end)
-		addToggle(auto, "Auto Cook",               true, function(state) rt.flags.autoCook      = state end)
-		addToggle(hkSec, "Auto Bills + Dishes",    true, function(state) rt.flags.housekeeping  = state end)
-		addToggle(misc, "Anti-AFK",                true, function(state) AntiAFK:set(state) end)
-
-		-- sliders
-		addSlider(hkSec, "Per tick actions", 1, 20, rt.tuners.housePerTick, function(v) rt.tuners.housePerTick = math.floor(v) end)
-		addSlider(hkSec, "Sweep every (s)",  0.2, 3.0, rt.tuners.housePeriod, function(v) rt.tuners.housePeriod = tonumber(string.format("%.2f", v)) end)
-		addSlider(cookSec, "Cook check (s)", 0.25, 2.0, rt.tuners.cookPeriod, function(v) rt.tuners.cookPeriod = tonumber(string.format("%.2f", v)) end)
-		addSlider(auto,   "Seat check (s)",  0.1,  1.0, rt.tuners.seatPeriod, function(v) rt.tuners.seatPeriod = tonumber(string.format("%.2f", v)) end)
-
-		-- live stats
-		local statsLabel = addLabel(misc, "Stats initialising...")
+		local statsLabel = addLabel(sec, "Stats initialising...")
 		task.spawn(function()
 			while true do
 				if statsLabel and statsLabel.Set then
 					statsLabel:Set(string.format(
-						"Stats: %d seated | %d orders | %d served | %d dishes | %d bills | %d cook starts",
-						rt.stats.groupsSeated, rt.stats.ordersTaken, rt.stats.served, rt.stats.dishes, rt.stats.bills, rt.stats.cookStarts
+						"Stats: seated %d | orders %d | served %d | dishes %d | bills %d | cook starts %d | stalls fixed %d | Q:%d/%d | holding:%s",
+						rt.stats.groupsSeated, rt.stats.ordersTaken, rt.stats.served, rt.stats.dishes, rt.stats.bills, rt.stats.cookStarts,
+						rt.stats.stallsFixed, #rt._serveQueue, #rt._orderQueue, tostring(rt._foodInHand ~= nil)
 					))
 				end
 				task.wait(1)
 			end
 		end)
+	else
+		warn("[RTHelper] UI: couldn’t create window; running headless.")
 	end
 else
 	warn("[RTHelper] UI not available; running headless.")
