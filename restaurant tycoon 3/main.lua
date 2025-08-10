@@ -1,5 +1,5 @@
--- RTHelper (tray-first FIFO serving + event housekeeping + ultra-perf)
--- Seat -> Take Orders -> Auto Cook (burst) -> Serve (FIFO while tray present) -> Bills/Dishes (per-table ChildAdded hooks)
+-- RTHelper (tray-hold fix: robust carry detect + mapped-serve; perf-safe)
+-- Seat -> Take Orders -> Auto Cook (burst) -> Serve (mapped while holding) -> Bills/Dishes (event-driven)
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -379,14 +379,13 @@ local function seatAndOrderTick()
 end
 
 -- ===== Waiting queue (FIFO, NPC-only) =====
-local waiterQueue, inQueue = {}, {}   -- array queue of keys; set membership
+local waiterQueue, inQueue = {}, {}   -- array queue; set membership
 local waitingIndex = {}               -- key -> true
 
 local function queueFront()
     while #waiterQueue > 0 do
         local k = waiterQueue[1]
         if waitingIndex[k] then return k end
-        -- stale -> drop
         inQueue[k] = nil
         table.remove(waiterQueue, 1)
     end
@@ -455,42 +454,60 @@ local function scanFoodFolderOnce() for _, ch in ipairs(FoodFolder:GetChildren()
 FoodFolder.ChildAdded:Connect(recordPlate)
 FoodFolder.ChildRemoved:Connect(function(ch) seenPlates[ch] = nil end)
 
--- ===== Tray / carry detection =====
-do
-    local function isTray(inst)
-        return typeof(inst)=="Instance"
-           and inst:IsA("Model")
-           and inst.Name:lower():find("tray") ~= nil
-    end
-    local function isHolding()
-        local char = LocalPlayer.Character
-        if not char then return false end
-        for _, ch in ipairs(char:GetChildren()) do
-            if isTray(ch) then return true end
-        end
-        return false
-    end
-    _G.__RTH_isHolding = isHolding
-
-    local function hookCharacter(char)
-        char.ChildAdded:Connect(function(ch)
-            if isTray(ch) then _G.__RTH_carryingSince = now() end
-            if isFoodPlate(ch) then _G.__RTH_carryingSince = now() end
-        end)
-        char.ChildRemoved:Connect(function(ch)
-            -- if tray/plate leaves, carryingSince resets naturally in serve flow
-        end)
-    end
-    if Players.LocalPlayer.Character then hookCharacter(Players.LocalPlayer.Character) end
-    Players.LocalPlayer.CharacterAdded:Connect(hookCharacter)
+-- ===== Carry detection (robust, shallow) =====
+local function isTrayModel(inst)
+    if not (typeof(inst)=="Instance" and inst:IsA("Model")) then return false end
+    local n = inst.Name:lower()
+    return n:find("tray") or n:find("serve") or n:find("carry")
 end
 
--- ===== Serve (FIFO while tray present) =====
-local carryingPlate = nil      -- last grabbed plate instance (optional)
-local currentTargetKey = nil   -- key we insist on while tray exists
+-- Return: hasCarry(bool), plate(Model or nil), hasTray(bool)
+local function getCarryState()
+    local char = LocalPlayer.Character
+    if not char then return false, nil, false end
+    local hasTray, foundPlate = false, nil
+
+    -- depth 0/1/2 scan (lightweight)
+    for _, a in ipairs(char:GetChildren()) do
+        if isFoodPlate(a) then foundPlate = a end
+        if isTrayModel(a) then hasTray = true end
+        if a:IsA("Model") then
+            for _, b in ipairs(a:GetChildren()) do
+                if isFoodPlate(b) then foundPlate = b end
+                if isTrayModel(b) then hasTray = true end
+                if b:IsA("Model") then
+                    for _, c in ipairs(b:GetChildren()) do
+                        if isFoodPlate(c) then foundPlate = c end
+                        if isTrayModel(c) then hasTray = true end
+                        if foundPlate and hasTray then break end
+                    end
+                end
+                if foundPlate and hasTray then break end
+            end
+        end
+        if foundPlate and hasTray then break end
+    end
+    local carrying = hasTray or (foundPlate ~= nil)
+    return carrying, foundPlate, hasTray
+end
+
+-- Plate -> mapped target ids (shallow attrs only)
+local gidAttrNames = { "GroupId","GroupID","Group","GID" }
+local cidAttrNames = { "CustomerId","CustomerID","Customer","CID" }
+local function plateTargetIds(plate)
+    if not plate then return nil,nil end
+    local gid, cid
+    for _, n in ipairs(gidAttrNames) do local v = plate:GetAttribute(n); if v ~= nil then gid = tostring(v) break end end
+    for _, n in ipairs(cidAttrNames) do local v = plate:GetAttribute(n); if v ~= nil then cid = tostring(v) break end end
+    if gid and cid then return gid, cid end
+    return nil, nil
+end
+
+-- ===== Serve (mapped while holding; FIFO fallback) =====
+local carryingPlate, holdSince = nil, 0
+local currentTargetKey = nil
 
 local function serveConfirm(gid, cid, plate)
-    -- success = plate left our character, or engine removed tray
     local deadline = now() + tuners.serveTimeout
     while now() < deadline do
         TaskCompleted:FireServer({
@@ -500,13 +517,14 @@ local function serveConfirm(gid, cid, plate)
             FoodModel  = plate,
             CustomerId = cid
         })
-        local waitUntil = now() + tuners.serveDelay
-        while now() < waitUntil do
+        local untilT = now() + tuners.serveDelay
+        while now() < untilT do
             task.wait(0.02)
             local char = LocalPlayer.Character
             if not plate or not plate.Parent then return true end
             if char and not plate:IsDescendantOf(char) then return true end
-            if _G.__RTH_isHolding and (not _G.__RTH_isHolding()) then return true end
+            local hasCarry = getCarryState()
+            if hasCarry == false then return true end
         end
     end
     local char = LocalPlayer.Character
@@ -518,61 +536,83 @@ end
 local function serveTick()
     if not flags.autoServe then return end
 
-    local hasTray = _G.__RTH_isHolding and _G.__RTH_isHolding()
-
-    -- If tray present: ONLY try to serve the head of the queue until tray disappears
-    if hasTray then
-        if not currentTargetKey then
-            currentTargetKey = queueFront()
+    -- refresh carry state directly from character (authoritative)
+    local hasCarry, realPlate = getCarryState()
+    if hasCarry then
+        -- update our handle if the engine reparented something
+        if realPlate then
+            carryingPlate = realPlate
+            if holdSince == 0 then holdSince = now() end
         end
-        if not currentTargetKey then
-            -- nothing to give; just wait for tray to clear (game state) to avoid picking anything new
+
+        -- If we have a plate, prefer its *mapped* target
+        if carryingPlate then
+            local mgid, mcid = plateTargetIds(carryingPlate)
+            if mgid and mcid and (not isPlayerCustomer(mgid,mcid)) then
+                local ok = serveConfirm(mgid, mcid, carryingPlate)
+                if ok then
+                    clearWaiting(mgid, mcid)
+                    carryingPlate, holdSince, currentTargetKey = nil, 0, nil
+                end
+                return
+            end
+        end
+
+        -- No mapping yet (or no plate found under tray) -> try queue head (may fail if dish mismatch; harmless)
+        currentTargetKey = currentTargetKey or queueFront()
+        if currentTargetKey then
+            local gid, cid = currentTargetKey:match("^(.-)|(.-)$")
+            if gid and cid and waitingIndex[currentTargetKey] and carryingPlate then
+                local ok = serveConfirm(gid, cid, carryingPlate)
+                if ok then
+                    clearWaiting(gid, cid)
+                    currentTargetKey = nil
+                    carryingPlate, holdSince = nil, 0
+                end
+            end
+        end
+        -- Keep holding and retry next tick.
+        return
+    else
+        -- not carrying -> reset and try to acquire new plate ONLY if someone is waiting
+        carryingPlate, holdSince, currentTargetKey = nil, 0, currentTargetKey or queueFront()
+        if not currentTargetKey then return end
+        if #PlateQ == 0 then scanFoodFolderOnce() end
+        local plate = qpop(PlateQ)
+        if not plate or not plate.Parent or not plate:IsDescendantOf(FoodFolder) then return end
+
+        local okGrab = pcall(function() GrabFoodRF:InvokeServer(plate) end)
+        if not okGrab then
+            if plate.Parent and plate:IsDescendantOf(FoodFolder) then qpush(PlateQ, plate) end
             return
         end
-        local gid, cid = currentTargetKey:match("^(.-)|(.-)$")
-        if not gid or not cid or not waitingIndex[currentTargetKey] then
-            -- stale -> get a fresh head
-            queueDropKey(currentTargetKey)
-            currentTargetKey = nil
-            return
+        carryingPlate = plate
+        holdSince = now()
+        _G.__RTH_carryingSince = holdSince
+
+        -- Try mapped consumer immediately if present
+        local mgid, mcid = plateTargetIds(plate)
+        if mgid and mcid and (not isPlayerCustomer(mgid,mcid)) then
+            local ok = serveConfirm(mgid, mcid, plate)
+            if ok then
+                clearWaiting(mgid, mcid)
+                carryingPlate, holdSince, currentTargetKey = nil, 0, nil
+                return
+            end
         end
-        -- Try to serve ONLY this customer
-        local ok = serveConfirm(gid, cid, carryingPlate)
-        if ok then
-            clearWaiting(gid, cid)
-            if waiterQueue[1] == currentTargetKey then table.remove(waiterQueue, 1) end
-            inQueue[currentTargetKey] = nil
-            currentTargetKey = nil
-            carryingPlate = nil
-        end
-        return
-    end
 
-    -- No tray present -> acquire next plate (only if we have someone to serve)
-    currentTargetKey = currentTargetKey or queueFront()
-    if not currentTargetKey then return end
-    if #PlateQ == 0 then scanFoodFolderOnce() end
-    local plate = qpop(PlateQ)
-    if not plate or not plate.Parent or not plate:IsDescendantOf(FoodFolder) then return end
-
-    local okGrab = pcall(function() GrabFoodRF:InvokeServer(plate) end)
-    if not okGrab then
-        if plate.Parent and plate:IsDescendantOf(FoodFolder) then qpush(PlateQ, plate) end
-        return
-    end
-    carryingPlate = plate
-    _G.__RTH_carryingSince = now()
-
-    -- Immediately try to serve the head of the queue
-    local gid, cid = currentTargetKey:match("^(.-)|(.-)$")
-    if gid and cid and waitingIndex[currentTargetKey] then
-        local ok = serveConfirm(gid, cid, plate)
-        if ok then
-            clearWaiting(gid, cid)
-            if waiterQueue[1] == currentTargetKey then table.remove(waiterQueue, 1) end
-            inQueue[currentTargetKey] = nil
-            currentTargetKey = nil
-            carryingPlate = nil
+        -- else try queue head; if mismatch, we’ll keep holding and retry next ticks once mapping appears.
+        local k = currentTargetKey
+        if k then
+            local gid, cid = k:match("^(.-)|(.-)$")
+            if gid and cid and waitingIndex[k] then
+                local ok = serveConfirm(gid, cid, plate)
+                if ok then
+                    clearWaiting(gid, cid)
+                    currentTargetKey = nil
+                    carryingPlate, holdSince = nil, 0
+                end
+            end
         end
     end
 end
@@ -646,7 +686,6 @@ if Cook.StateUpdated then
         burst(nil, nil, state.InstructionKey)
     end)
 end
-
 local function cookTick()
     if not flags.autoCook then return end
     if (not cookActive) or (now() - cookLast > 0.6) then
@@ -697,20 +736,18 @@ local function addToggle(where,label,default,cb)
     if where and type(where.AddToggle)=="function" then where:AddToggle(label,default,cb); return end
     cb(default)
 end
-
 task.defer(function()
     local UI = loadUILib()
     if not UI then return end
-    local win = mkWindow(UI, { Title="RT3 Helper (FIFO Tray)", CFG="RT3_FIFO_TRAY", Key=Enum.KeyCode.RightShift })
+    local win = mkWindow(UI, { Title="RT3 Helper (Mapped Hold)", CFG="RT3_MAPPED_HOLD", Key=Enum.KeyCode.RightShift })
     if not win then return end
     local tab = (win.Tab and win:Tab("Automation")) or win
     local sec = (tab.Section and tab:Section("Main")) or tab
-
     addToggle(sec,"Auto Seat + Order",true,function(v) flags.autoSeatOrder=v end)
-    addToggle(sec,"Auto Serve (FIFO)",true,function(v) flags.autoServe=v end)
+    addToggle(sec,"Auto Serve (mapped hold)",true,function(v) flags.autoServe=v end)
     addToggle(sec,"Auto Cook (burst)",true,function(v) flags.autoCook=v end)
     addToggle(sec,"Bills + Dishes (event)",true,function(v) flags.housekeeping=v end)
     addToggle(sec,"Anti-AFK",true,function(v) flags.antiAFK=v end)
 end)
 
-print("[RTHelper] loaded (FIFO tray serving + event housekeeping + perf).")
+print("[RTHelper] loaded (tray-hold mapped serving + event housekeeping + perf).")
