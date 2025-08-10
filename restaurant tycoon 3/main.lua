@@ -1,5 +1,5 @@
--- RTHelper (single-file, perf-tuned + player-order ignore + stale-prune)
--- Seat -> Take Orders -> Auto Cook (burst) -> Serve (single-hold, order-driven) -> Bills/Dishes (active tables only)
+-- RTHelper (single-file, event-driven housekeeping + perf + no-player-orders)
+-- Seat -> Take Orders -> Auto Cook (burst) -> Serve (single-hold, order-driven) -> Bills/Dishes (per-table ChildAdded hooks)
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -90,8 +90,7 @@ local tuners = {
     servePeriod  = 0.04,
     serveDelay   = 0.05,
     serveTimeout = 1.20,
-    housePeriod  = 0.20,  -- sliced over active tables
-    holdGrace    = 0.70,  -- treat as "holding" shortly after grab (reparent jitter)
+    holdGrace    = 0.70,  -- after grabbing a plate, give serving priority for this long
 }
 local ORDER_COOLDOWN = 0.5
 local SEAT_COOLDOWN  = 1.5
@@ -104,7 +103,7 @@ Players.PlayerAdded:Connect(function(plr) playerNames[plr.Name] = true end)
 Players.PlayerRemoving:Connect(function(plr) playerNames[plr.Name] = nil end)
 local function looksLikePlayerName(s) return s and playerNames[tostring(s)] == true end
 
--- ===== Tables (cache once; updated by child add/remove) =====
+-- ===== Tables (cache; updated by child add/remove) =====
 local tablesDirty = true
 local tableList, tableMeta = {}, {} -- [Model] = { seats=#, plate=Base.PlateHeight? }
 
@@ -142,24 +141,101 @@ local function ensureTables() if tablesDirty or #tableList==0 then rebuildTables
 Surface.ChildAdded:Connect(function() tablesDirty = true end)
 Surface.ChildRemoved:Connect(function() tablesDirty = true end)
 
--- ===== Active table set (for housekeeping) =====
-local activeTables = {}  -- [tableModel] = true
-local activeList   = {}  -- array mirror for sliced iteration
-local activeIdx    = 1
-local function addActive(tbl)
-    if not tbl or not tbl.Parent or activeTables[tbl] then return end
-    activeTables[tbl] = true
-    activeList[#activeList+1] = tbl
-    dprint("Active+", tbl.Name)
-end
-local function removeActive(tbl)
-    if not tbl or not activeTables[tbl] then return end
-    activeTables[tbl] = nil
-    for i,v in ipairs(activeList) do if v==tbl then table.remove(activeList, i) break end end
-    dprint("Active-", tbl and tbl.Name or "?")
+-- ===== Active table watchers (event-driven housekeeping) =====
+local tableWatch = {} -- [tbl] = { addConn=RBXScriptConnection, ancConn=..., billConns={...} }
+
+local function disconnectWatch(tbl)
+    local rec = tableWatch[tbl]; if not rec then return end
+    if rec.addConn then pcall(function() rec.addConn:Disconnect() end) end
+    if rec.ancConn then pcall(function() rec.ancConn:Disconnect() end) end
+    if rec.billConns then
+        for _,c in ipairs(rec.billConns) do pcall(function() c:Disconnect() end) end
+    end
+    tableWatch[tbl] = nil
+    dprint("Unwatch", tbl and tbl.Name or "?")
 end
 
--- ===== Customers (lightweight discovery + char index) =====
+local function tryCollectDishes(tbl)
+    if not flags.housekeeping then return end
+    if tbl and tbl.Parent then
+        -- give serving a short priority window
+        if _G.__RTH_carryingSince and (now() - _G.__RTH_carryingSince < tuners.holdGrace) then
+            task.delay(0.25, function() tryCollectDishes(tbl) end)
+            return
+        end
+        TaskCompleted:FireServer({ Name=TaskEnum.CollectDishes, FurnitureModel=tbl, Tycoon=Tycoon })
+        dprint("Collect dishes", tbl.Name)
+    end
+end
+
+local function tryCollectBill(tbl, bill)
+    if not flags.housekeeping then return end
+    if not (tbl and tbl.Parent and bill and bill.Parent==tbl) then return end
+    if bill:GetAttribute("Taken") == true then return end
+    if _G.__RTH_carryingSince and (now() - _G.__RTH_carryingSince < tuners.holdGrace) then
+        task.delay(0.25, function() tryCollectBill(tbl, bill) end)
+        return
+    end
+    TaskCompleted:FireServer({ Name=TaskEnum.CollectBill, FurnitureModel=tbl, Tycoon=Tycoon })
+    dprint("Collect bill", tbl.Name)
+end
+
+local function maybeCleanupTableWatch(tbl)
+    if not tbl or not tbl.Parent then disconnectWatch(tbl); return end
+    local bill = tbl:FindFirstChild("Bill")
+    local trash = tbl:FindFirstChild("Trash")
+    local inUse = tbl:GetAttribute("InUse") == true
+    if (not inUse) and (not bill) and (not trash) then
+        disconnectWatch(tbl)
+    end
+end
+
+local function wireBillSignals(tbl, bill)
+    local rec = tableWatch[tbl]; if not rec then return end
+    rec.billConns = rec.billConns or {}
+    -- Taken attribute toggles fast; keep trying until true/removed
+    table.insert(rec.billConns, bill:GetAttributeChangedSignal("Taken"):Connect(function()
+        if bill:GetAttribute("Taken") ~= true then
+            tryCollectBill(tbl, bill)
+        else
+            task.defer(function() maybeCleanupTableWatch(tbl) end)
+        end
+    end))
+    -- If bill vanishes, try cleanup
+    table.insert(rec.billConns, bill.AncestryChanged:Connect(function(_, parent)
+        if parent ~= tbl then task.defer(function() maybeCleanupTableWatch(tbl) end) end
+    end))
+end
+
+local function watchTable(tbl)
+    if not tbl or not tbl.Parent or tableWatch[tbl] then return end
+    local rec = {}
+    rec.addConn = tbl.ChildAdded:Connect(function(ch)
+        if ch.Name == "Trash" then
+            tryCollectDishes(tbl)
+        elseif ch.Name == "Bill" then
+            tryCollectBill(tbl, ch)
+            wireBillSignals(tbl, ch)
+        end
+    end)
+    rec.ancConn = tbl.AncestryChanged:Connect(function(_, parent)
+        if not parent then disconnectWatch(tbl) end
+    end)
+    tableWatch[tbl] = rec
+    dprint("Watch", tbl.Name)
+
+    -- Prime: if Trash/Bill already exist, act immediately
+    local bill = tbl:FindFirstChild("Bill")
+    if bill then
+        tryCollectBill(tbl, bill)
+        wireBillSignals(tbl, bill)
+    end
+    if tbl:FindFirstChild("Trash") then
+        tryCollectDishes(tbl)
+    end
+end
+
+-- ===== Customers (discovery + char index) =====
 local charIndex = {} -- ["gid|cid"]=character model
 local function enumerateCustomersByModule()
     local out, seen = {}, {}
@@ -274,7 +350,7 @@ local function readDesiredDishFromChar(char)
     return nil
 end
 
--- ===== Seat + Order (adds table into active set) =====
+-- ===== Seat + Order (also starts housekeeping watch for that table) =====
 local seatCD, seatPending, seatedOrQueued, orderCD = {}, {}, {}, {}
 
 local function bestTableFor(group)
@@ -338,7 +414,8 @@ local function seatAndOrderTick()
             if tbl then
                 TaskCompleted:FireServer({ Name=TaskEnum.SendToTable, GroupId=gid, Tycoon=Tycoon, FurnitureModel=tbl })
                 seatCD[gid]=t; seatPending[gid]=t; seatedOrQueued[gid]=true
-                addActive(tbl)
+                -- Start housekeeping watch for this table immediately
+                watchTable(tbl)
                 dprint("SendToTable", gid, tbl.Name)
             end
         end
@@ -428,7 +505,6 @@ end
 
 local dishAttrNames = { "DishId","Dish","FoodId","Food","RecipeId","MealId","ItemId" }
 local plateDish = setmetatable({}, { __mode="k" }) -- cache per plate model (weak keys)
-
 local function readDishIdFromPlate(plate)
     local cached = plateDish[plate]
     if cached ~= nil then return cached end
@@ -518,7 +594,6 @@ local function chooseTargetsForDish(dishId)
 end
 
 local function pickBestPlate()
-    -- prefer a plate whose dish is wanted by NPCs
     for i=1,#PlateQ do
         local p = PlateQ[i]
         if p and p.Parent and p:IsDescendantOf(FoodFolder) then
@@ -528,7 +603,6 @@ local function pickBestPlate()
                 table.remove(PlateQ, i)
                 return p, did, t
             end
-            -- fallback to direct gid/cid on plate (skip players)
             local gid, cid = plateTargetIds(p)
             if gid and cid and (not isPlayerCustomer(gid,cid)) then
                 table.remove(PlateQ, i)
@@ -548,7 +622,6 @@ local function serveTick()
         local dishId = readDishIdFromPlate(carryingPlate)
         local targets = chooseTargetsForDish(dishId)
         if #targets == 0 then
-            -- try plate's own shallow mapping
             local gid, cid = plateTargetIds(carryingPlate)
             if gid and cid and (not isPlayerCustomer(gid,cid)) then
                 targets = { {gid=gid,cid=cid,key=keyFor(gid,cid)} }
@@ -561,6 +634,7 @@ local function serveTick()
         end
         if not served then dprint("Serve retry failed; dropping carry") end
         carryingPlate, carrySince = nil, 0
+        _G.__RTH_carryingSince = nil
         return
     end
 
@@ -570,7 +644,6 @@ local function serveTick()
     if not plate then return end
     if not (plate.Parent and plate:IsDescendantOf(FoodFolder)) then return end
     if not targets or #targets == 0 then
-        -- nobody valid -> park it back
         qpush(PlateQ, plate)
         return
     end
@@ -582,6 +655,7 @@ local function serveTick()
         return
     end
     carryingPlate, carrySince = plate, now()
+    _G.__RTH_carryingSince = carrySince
 
     -- immediate attempt
     local served = false
@@ -592,6 +666,7 @@ local function serveTick()
     if served then
         dprint("Served ✓ (immediate)")
         carryingPlate, carrySince = nil, 0
+        _G.__RTH_carryingSince = nil
     else
         dprint("Immediate serve failed; will retry")
     end
@@ -674,54 +749,22 @@ local function cookTick()
     end
 end
 
--- ===== Housekeeping (only active tables; sliced; hands free) =====
-local dishCD, billCD = {}, {}
-local function tableLooksIdle(tbl)
-    if not tbl or not tbl.Parent then return true end
-    local bill = tbl:FindFirstChild("Bill")
-    if bill and bill:GetAttribute("Taken") ~= true then return false end
-    if tbl:FindFirstChild("Trash") then return false end
-    if tbl:GetAttribute("InUse") == true then return false end
-    return true
-end
-
-local function houseTick()
-    if not flags.housekeeping then return end
-    if carryingPlate and (now() - (carrySince or 0) < tuners.holdGrace) then return end
-    ensureTables()
-    if #activeList == 0 then return end
-
-    local slice = #activeList
-    for _=1, slice do
-        if activeIdx > #activeList then activeIdx = 1 end
-        local tbl = activeList[activeIdx]; activeIdx = activeIdx + 1
-        if tbl and tbl.Parent then
-            local t = now()
-            if tbl:FindFirstChild("Trash") and (t - (dishCD[tbl] or 0) >= 0.45) then
-                dishCD[tbl] = t
-                TaskCompleted:FireServer({ Name=TaskEnum.CollectDishes, FurnitureModel=tbl, Tycoon=Tycoon })
-                dprint("Collect dishes", tbl.Name)
-            end
-            local bill = tbl:FindFirstChild("Bill")
-            if bill and bill:GetAttribute("Taken") ~= true and (t - (billCD[tbl] or 0) >= 0.9) then
-                billCD[tbl] = t
-                TaskCompleted:FireServer({ Name=TaskEnum.CollectBill, FurnitureModel=tbl, Tycoon=Tycoon })
-                dprint("Collect bill", tbl.Name)
-            end
-            if tableLooksIdle(tbl) then removeActive(tbl) end
-        else
-            removeActive(tbl)
-        end
-    end
-end
-
 -- ===== Loops =====
-task.spawn(function() dprint("Seat/Order loop start"); while true do pcall(seatAndOrderTick); task.wait(tuners.seatPeriod) end end)
-task.spawn(function() dprint("Serve loop start");      while true do pcall(serveTick);       task.wait(tuners.servePeriod) end end)
-task.spawn(function() dprint("Cook loop start");       while true do pcall(cookTick);        task.wait(tuners.cookPeriod) end end)
-task.spawn(function() dprint("House loop start");      while true do pcall(houseTick);       task.wait(tuners.housePeriod) end end)
+task.spawn(function() while true do pcall(seatAndOrderTick); task.wait(tuners.seatPeriod) end end)
+task.spawn(function() while true do pcall(serveTick);       task.wait(tuners.servePeriod) end end)
+task.spawn(function() while true do pcall(cookTick);        task.wait(tuners.cookPeriod) end end)
+-- light janitor for workspace.Temp
 task.spawn(function() while task.wait(180) do if workspace:FindFirstChild("Temp") then workspace.Temp:ClearAllChildren() end end end)
 
+-- Prime: start watching any tables already in-use when script loads
+ensureTables()
+for _, tbl in ipairs(tableList) do
+    local inUse = tbl:GetAttribute("InUse") == true
+    if inUse or tbl:FindFirstChild("Bill") or tbl:FindFirstChild("Trash") then
+        watchTable(tbl)
+    end
+end
+-- Prime once so seating/orders don't wait a full tick
 pcall(seatAndOrderTick)
 scanFoodFolderOnce()
 
@@ -759,7 +802,7 @@ end
 task.defer(function()
     local UI = loadUILib()
     if not UI then return end
-    local win = mkWindow(UI, { Title="RT3 Helper (Perf+NoPlayerOrders)", CFG="RT3_PERF_NOPLAYERS", Key=Enum.KeyCode.RightShift })
+    local win = mkWindow(UI, { Title="RT3 Helper (Event Housekeeping)", CFG="RT3_EVT_HK", Key=Enum.KeyCode.RightShift })
     if not win then return end
     local tab = (win.Tab and win:Tab("Automation")) or win
     local sec = (tab.Section and tab:Section("Main")) or tab
@@ -773,9 +816,6 @@ task.defer(function()
 
     addToggle(sec,"Auto Cook (burst)",true,function(v) flags.autoCook=v end)
     addSlider(sec,"Cook tick (s)",0.10,1.00,tuners.cookPeriod,function(v) tuners.cookPeriod=tonumber(string.format("%.2f",v)) end)
-
-    addToggle(sec,"Bills + Dishes (active only)",true,function(v) flags.housekeeping=v end)
-    addSlider(sec,"House tick (s)",0.10,1.00,tuners.housePeriod,function(v) tuners.housePeriod=tonumber(string.format("%.2f",v)) end)
 end)
 
-print("[RTHelper] loaded (perf tuned + player-order ignore + prune).")
+print("[RTHelper] loaded (event-driven housekeeping + perf + no-player-orders).")
