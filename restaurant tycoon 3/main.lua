@@ -697,7 +697,7 @@ end
 task.spawn(function() while true do pcall(seatAndOrderTick); task.wait(tuners.seatPeriod) end end)
 task.spawn(function() while true do pcall(serveTick);       task.wait(tuners.servePeriod) end end)
 task.spawn(function() while true do pcall(cookTick);        task.wait(tuners.cookPeriod) end end)
-task.spawn(function() while task.wait(180) do local t=workspace:FindFirstChild("Temp"); if t then t:ClearAllChildren() end end end)
+task.spawn(function() while task.wait(5) do local t=workspace:FindFirstChild("Temp"); if t then t:ClearAllChildren() end end end)
 
 -- Prime housekeeping on existing tables
 ensureTables()
