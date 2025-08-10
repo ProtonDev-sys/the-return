@@ -1,5 +1,5 @@
--- RTHelper (single-file, event-driven housekeeping + perf + no-player-orders)
--- Seat -> Take Orders -> Auto Cook (burst) -> Serve (single-hold, order-driven) -> Bills/Dishes (per-table ChildAdded hooks)
+-- RTHelper (single-file, event-driven housekeeping + perf + resilient serving)
+-- Seat -> Take Orders -> Auto Cook (burst) -> Serve (single-hold; widen targets) -> Bills/Dishes (per-table ChildAdded hooks)
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -90,20 +90,20 @@ local tuners = {
     servePeriod  = 0.04,
     serveDelay   = 0.05,
     serveTimeout = 1.20,
-    holdGrace    = 0.70,  -- after grabbing a plate, give serving priority for this long
+    holdGrace    = 0.70,
 }
 local ORDER_COOLDOWN = 0.5
 local SEAT_COOLDOWN  = 1.5
 local SEAT_RETRY_SEC = 3.0
 
--- ===== Player name cache (for player-order detection) =====
+-- ===== Player names (skip player orders) =====
 local playerNames = {}
 for _,plr in ipairs(Players:GetPlayers()) do playerNames[plr.Name] = true end
 Players.PlayerAdded:Connect(function(plr) playerNames[plr.Name] = true end)
 Players.PlayerRemoving:Connect(function(plr) playerNames[plr.Name] = nil end)
 local function looksLikePlayerName(s) return s and playerNames[tostring(s)] == true end
 
--- ===== Tables (cache; updated by child add/remove) =====
+-- ===== Tables (cache) =====
 local tablesDirty = true
 local tableList, tableMeta = {}, {} -- [Model] = { seats=#, plate=Base.PlateHeight? }
 
@@ -142,15 +142,13 @@ Surface.ChildAdded:Connect(function() tablesDirty = true end)
 Surface.ChildRemoved:Connect(function() tablesDirty = true end)
 
 -- ===== Active table watchers (event-driven housekeeping) =====
-local tableWatch = {} -- [tbl] = { addConn=RBXScriptConnection, ancConn=..., billConns={...} }
+local tableWatch = {} -- [tbl] = { addConn=..., ancConn=..., billConns={...} }
 
 local function disconnectWatch(tbl)
     local rec = tableWatch[tbl]; if not rec then return end
     if rec.addConn then pcall(function() rec.addConn:Disconnect() end) end
     if rec.ancConn then pcall(function() rec.ancConn:Disconnect() end) end
-    if rec.billConns then
-        for _,c in ipairs(rec.billConns) do pcall(function() c:Disconnect() end) end
-    end
+    if rec.billConns then for _,c in ipairs(rec.billConns) do pcall(function() c:Disconnect() end) end end
     tableWatch[tbl] = nil
     dprint("Unwatch", tbl and tbl.Name or "?")
 end
@@ -158,7 +156,6 @@ end
 local function tryCollectDishes(tbl)
     if not flags.housekeeping then return end
     if tbl and tbl.Parent then
-        -- give serving a short priority window
         if _G.__RTH_carryingSince and (now() - _G.__RTH_carryingSince < tuners.holdGrace) then
             task.delay(0.25, function() tryCollectDishes(tbl) end)
             return
@@ -167,7 +164,6 @@ local function tryCollectDishes(tbl)
         dprint("Collect dishes", tbl.Name)
     end
 end
-
 local function tryCollectBill(tbl, bill)
     if not flags.housekeeping then return end
     if not (tbl and tbl.Parent and bill and bill.Parent==tbl) then return end
@@ -179,21 +175,16 @@ local function tryCollectBill(tbl, bill)
     TaskCompleted:FireServer({ Name=TaskEnum.CollectBill, FurnitureModel=tbl, Tycoon=Tycoon })
     dprint("Collect bill", tbl.Name)
 end
-
 local function maybeCleanupTableWatch(tbl)
     if not tbl or not tbl.Parent then disconnectWatch(tbl); return end
     local bill = tbl:FindFirstChild("Bill")
     local trash = tbl:FindFirstChild("Trash")
     local inUse = tbl:GetAttribute("InUse") == true
-    if (not inUse) and (not bill) and (not trash) then
-        disconnectWatch(tbl)
-    end
+    if (not inUse) and (not bill) and (not trash) then disconnectWatch(tbl) end
 end
-
 local function wireBillSignals(tbl, bill)
     local rec = tableWatch[tbl]; if not rec then return end
     rec.billConns = rec.billConns or {}
-    -- Taken attribute toggles fast; keep trying until true/removed
     table.insert(rec.billConns, bill:GetAttributeChangedSignal("Taken"):Connect(function()
         if bill:GetAttribute("Taken") ~= true then
             tryCollectBill(tbl, bill)
@@ -201,12 +192,10 @@ local function wireBillSignals(tbl, bill)
             task.defer(function() maybeCleanupTableWatch(tbl) end)
         end
     end))
-    -- If bill vanishes, try cleanup
     table.insert(rec.billConns, bill.AncestryChanged:Connect(function(_, parent)
         if parent ~= tbl then task.defer(function() maybeCleanupTableWatch(tbl) end) end
     end))
 end
-
 local function watchTable(tbl)
     if not tbl or not tbl.Parent or tableWatch[tbl] then return end
     local rec = {}
@@ -223,19 +212,12 @@ local function watchTable(tbl)
     end)
     tableWatch[tbl] = rec
     dprint("Watch", tbl.Name)
-
-    -- Prime: if Trash/Bill already exist, act immediately
     local bill = tbl:FindFirstChild("Bill")
-    if bill then
-        tryCollectBill(tbl, bill)
-        wireBillSignals(tbl, bill)
-    end
-    if tbl:FindFirstChild("Trash") then
-        tryCollectDishes(tbl)
-    end
+    if bill then tryCollectBill(tbl, bill); wireBillSignals(tbl, bill) end
+    if tbl:FindFirstChild("Trash") then tryCollectDishes(tbl) end
 end
 
--- ===== Customers (discovery + char index) =====
+-- ===== Customers =====
 local charIndex = {} -- ["gid|cid"]=character model
 local function enumerateCustomersByModule()
     local out, seen = {}, {}
@@ -299,7 +281,7 @@ end
 local function refreshCharIndex() enumerateCustomers() end
 local function getChar(gid,cid) return charIndex[keyFor(gid,cid)] end
 
--- ===== Player-order detection (skip these completely) =====
+-- ===== Player-order detection =====
 local playerishAttr = { "IsPlayer","PlayerId","Player","PlayerName","Username","DisplayName" }
 local function isPlayerishObject(obj)
     if not obj then return false end
@@ -325,7 +307,7 @@ local function isPlayerCustomer(gid,cid)
     return isPlayerishObject(char) or isPlayerishObject(char.Parent)
 end
 
--- ===== Read desired dish (bounded) =====
+-- ===== Desired dish (bounded) =====
 local dishNames  = { "DishId","Dish","FoodId","Food","RecipeId","MealId","ItemId","Order","OrderId","Wanted","Requested","FoodType","Meal" }
 local function readDesiredDishFromChar(char)
     if not char then return nil end
@@ -350,9 +332,8 @@ local function readDesiredDishFromChar(char)
     return nil
 end
 
--- ===== Seat + Order (also starts housekeeping watch for that table) =====
+-- ===== Seat + Order =====
 local seatCD, seatPending, seatedOrQueued, orderCD = {}, {}, {}, {}
-
 local function bestTableFor(group)
     ensureTables()
     local size = 0
@@ -369,13 +350,11 @@ local function bestTableFor(group)
     end
     return best
 end
-
 local function seatAndOrderTick()
     if not flags.autoSeatOrder then return end
     local t = now()
     local cus = enumerateCustomers()
 
-    -- Take orders
     for _, rec in ipairs(cus) do
         local gid, cid = rec.gid, rec.cid
         local ok, st = pcall(Customers.GetCustomerState, Customers, Tycoon, gid, cid)
@@ -389,7 +368,6 @@ local function seatAndOrderTick()
         end
     end
 
-    -- Group seating
     local groupsById, seenGids = {}, {}
     for _, rec in ipairs(cus) do groupsById[rec.gid] = rec.group; seenGids[rec.gid] = true end
     for gid in pairs(seatedOrQueued) do
@@ -414,26 +392,22 @@ local function seatAndOrderTick()
             if tbl then
                 TaskCompleted:FireServer({ Name=TaskEnum.SendToTable, GroupId=gid, Tycoon=Tycoon, FurnitureModel=tbl })
                 seatCD[gid]=t; seatPending[gid]=t; seatedOrQueued[gid]=true
-                -- Start housekeeping watch for this table immediately
                 watchTable(tbl)
                 dprint("SendToTable", gid, tbl.Name)
             end
         end
     end
 
-    enumerateCustomers() -- keep char index fresh
+    enumerateCustomers()
 end
 
--- ===== Waiting and dish desires (event-driven; skip players) =====
+-- ===== Waiting & desires (skip players) =====
 local waitingIndex = {}               -- ["gid|cid"]=true
 local desiredFoodByCustomer = {}      -- ["gid|cid"]=dishId
 local waitingByFood = {}              -- [dishId]={ "gid|cid", ... }
 
 local function pushWaitingForDish(gid, cid)
-    if isPlayerCustomer(gid,cid) then
-        dprint("Skip player waiter", gid, cid)
-        return
-    end
+    if isPlayerCustomer(gid,cid) then dprint("Skip player waiter", gid, cid); return end
     local key = keyFor(gid,cid)
     waitingIndex[key] = true
     local char = getChar(gid,cid)
@@ -461,7 +435,6 @@ local function clearWaiting(gid, cid)
     end
     desiredFoodByCustomer[key] = nil
 end
-
 if Customers.CustomerStateChanged then
     Customers.CustomerStateChanged:Connect(function(ty, gid, cid, _, state)
         if ty ~= Tycoon then return end
@@ -474,8 +447,6 @@ if Customers.CustomerStateChanged then
         end
     end)
 end
-
--- periodic prune: remove vanished or non-waiting entries (lightweight)
 local lastPrune = 0
 local function pruneWaitingIfNeeded()
     if now() - (lastPrune or 0) < 3.0 then return end
@@ -495,16 +466,15 @@ local function pruneWaitingIfNeeded()
     end
 end
 
--- ===== Plates (event-driven queue) =====
+-- ===== Plates =====
 local function isFoodPlate(inst)
     if not (typeof(inst)=="Instance" and inst:IsA("Model")) then return false end
     local n = tostring(inst.Name)
     if n:lower() == "trash" then return false end
-    return n:match("^%d+$") ~= nil -- numeric ids only; player plates usually not pure digits
+    return n:match("^%d+$") ~= nil
 end
-
 local dishAttrNames = { "DishId","Dish","FoodId","Food","RecipeId","MealId","ItemId" }
-local plateDish = setmetatable({}, { __mode="k" }) -- cache per plate model (weak keys)
+local plateDish = setmetatable({}, { __mode="k" })
 local function readDishIdFromPlate(plate)
     local cached = plateDish[plate]
     if cached ~= nil then return cached end
@@ -516,8 +486,6 @@ local function readDishIdFromPlate(plate)
     plateDish[plate] = id
     return id
 end
-
--- shallow target ids from plate (no deep scan)
 local gidAttrNames = { "GroupId","GroupID","Group","GID" }
 local cidAttrNames = { "CustomerId","CustomerID","Customer","CID" }
 local function plateTargetIds(plate)
@@ -531,21 +499,18 @@ end
 local PlateQ, seenPlates = {}, {}
 local function qpush(q,v) q[#q+1] = v end
 local function qpop(q) if #q==0 then return nil end local v=q[1]; table.remove(q,1); return v end
-
 local function recordPlate(plate)
     if not isFoodPlate(plate) or seenPlates[plate] then return end
     seenPlates[plate] = true
     qpush(PlateQ, plate)
-    readDishIdFromPlate(plate) -- prime cache
+    readDishIdFromPlate(plate)
     dprint("Plate +", plate.Name, "dish", plateDish[plate] or "?")
 end
-local function scanFoodFolderOnce()
-    for _, ch in ipairs(FoodFolder:GetChildren()) do recordPlate(ch) end
-end
+local function scanFoodFolderOnce() for _, ch in ipairs(FoodFolder:GetChildren()) do recordPlate(ch) end end
 FoodFolder.ChildAdded:Connect(recordPlate)
 FoodFolder.ChildRemoved:Connect(function(ch) seenPlates[ch] = nil; plateDish[ch] = nil end)
 
--- ===== Serve (single-hold with immediate delivery) =====
+-- ===== Serve (resilient single-hold; widen targets before giving up) =====
 local carryingPlate, carrySince = nil, 0
 
 local function serveConfirm(gid, cid, plate)
@@ -571,13 +536,18 @@ end
 
 local function chooseTargetsForDish(dishId)
     local targets = {}
+    local seen = {}
     local list = dishId and waitingByFood[dishId] or nil
     if list and #list > 0 then
         for _, k in ipairs(list) do
             if waitingIndex[k] then
                 local gid, cid = k:match("^(.-)|(.-)$")
                 if gid and cid and (not isPlayerCustomer(gid,cid)) then
-                    targets[#targets+1] = {gid=gid, cid=cid, key=k}
+                    local kk = keyFor(gid,cid)
+                    if not seen[kk] then
+                        targets[#targets+1] = {gid=gid, cid=cid, key=kk}
+                        seen[kk] = true
+                    end
                 end
             end
         end
@@ -586,7 +556,7 @@ local function chooseTargetsForDish(dishId)
         for k,_ in pairs(waitingIndex) do
             local gid, cid = k:match("^(.-)|(.-)$")
             if gid and cid and (not isPlayerCustomer(gid,cid)) then
-                targets[#targets+1] = {gid=gid, cid=cid, key=k}
+                if not seen[k] then targets[#targets+1] = {gid=gid, cid=cid, key=k}; seen[k]=true end
             end
         end
     end
@@ -613,40 +583,68 @@ local function pickBestPlate()
     return nil, nil, nil
 end
 
+local function buildTargetOrderForPlate(plate)
+    -- NEW: prefer mapped target first, then all NPCs waiting for this dish, then any waiter.
+    local targets, seen = {}, {}
+
+    local mgid, mcid = plateTargetIds(plate)
+    if mgid and mcid and (not isPlayerCustomer(mgid,mcid)) then
+        local k = keyFor(mgid,mcid)
+        targets[#targets+1] = {gid=mgid, cid=mcid, key=k}
+        seen[k] = true
+    end
+
+    local did = readDishIdFromPlate(plate)
+    local dishTargets = chooseTargetsForDish(did)
+    for _,t in ipairs(dishTargets) do
+        if not seen[t.key or keyFor(t.gid,t.cid)] then
+            targets[#targets+1] = t
+            seen[t.key or keyFor(t.gid,t.cid)] = true
+        end
+    end
+
+    if #targets == 0 then
+        -- as a last resort try any non-player waiter (chooseTargetsForDish already does this when no dish match)
+        targets = dishTargets
+    end
+    return targets, did
+end
+
 local function serveTick()
     if not flags.autoServe then return end
     pruneWaitingIfNeeded()
 
-    -- Finish delivery if already holding
+    -- If engine already detached the plate, clear our local handle
+    if carryingPlate and (not carryingPlate.Parent) then
+        carryingPlate, carrySince = nil, 0
+        _G.__RTH_carryingSince = nil
+    end
+
+    -- Finish delivery if already holding: try mapped -> dish waiters -> any waiter; DO NOT drop the carry if it fails.
     if carryingPlate then
-        local dishId = readDishIdFromPlate(carryingPlate)
-        local targets = chooseTargetsForDish(dishId)
-        if #targets == 0 then
-            local gid, cid = plateTargetIds(carryingPlate)
-            if gid and cid and (not isPlayerCustomer(gid,cid)) then
-                targets = { {gid=gid,cid=cid,key=keyFor(gid,cid)} }
-            end
-        end
+        local targets = buildTargetOrderForPlate(carryingPlate)
         local served = false
         for _, t in ipairs(targets) do
             served = serveConfirm(t.gid, t.cid, carryingPlate)
             if served then clearWaiting(t.gid, t.cid) break end
         end
-        if not served then dprint("Serve retry failed; dropping carry") end
-        carryingPlate, carrySince = nil, 0
-        _G.__RTH_carryingSince = nil
+        if served then
+            dprint("Served ✓ (retry)")
+            carryingPlate, carrySince = nil, 0
+            _G.__RTH_carryingSince = nil
+        else
+            -- Keep holding; we’ll retry next tick with a fresh target list so we never sit idle with the wrong target.
+            dprint("Hold plate; will retry next tick")
+        end
         return
     end
 
-    -- Acquire best plate (only if it has an NPC target)
+    -- Acquire best plate (only if it has an NPC target somewhere)
     if #PlateQ == 0 then scanFoodFolderOnce() end
-    local plate, dishId, targets = pickBestPlate()
+    local plate, _, initialTargets = pickBestPlate()
     if not plate then return end
     if not (plate.Parent and plate:IsDescendantOf(FoodFolder)) then return end
-    if not targets or #targets == 0 then
-        qpush(PlateQ, plate)
-        return
-    end
+    if not initialTargets or #initialTargets == 0 then qpush(PlateQ, plate); return end
 
     local okGrab = pcall(function() GrabFoodRF:InvokeServer(plate) end)
     if not okGrab then
@@ -657,7 +655,8 @@ local function serveTick()
     carryingPlate, carrySince = plate, now()
     _G.__RTH_carryingSince = carrySince
 
-    -- immediate attempt
+    -- Immediate attempt with widened target order (mapped first, then dish waiters, then any)
+    local targets = buildTargetOrderForPlate(plate)
     local served = false
     for _, tgt in ipairs(targets) do
         served = serveConfirm(tgt.gid, tgt.cid, plate)
@@ -668,11 +667,12 @@ local function serveTick()
         carryingPlate, carrySince = nil, 0
         _G.__RTH_carryingSince = nil
     else
-        dprint("Immediate serve failed; will retry")
+        dprint("Immediate serve failed; will retry while holding")
+        -- Keep carrying; next ticks will broaden dynamically as new waiters appear.
     end
 end
 
--- ===== Cooking (burst; minimal checks) =====
+-- ===== Cooking (burst) =====
 local cookActive, cookLast = false, 0
 if Cook.Started  then Cook.Started:Connect (function(ty) if ty==Tycoon then cookActive=true;  cookLast=now(); dprint("Cook started")  end end) end
 if Cook.Finished then Cook.Finished:Connect(function(ty) if ty==Tycoon then cookActive=false; cookLast=now(); dprint("Cook finished") end end) end
@@ -741,7 +741,6 @@ if Cook.StateUpdated then
         burst(nil, nil, state.InstructionKey)
     end)
 end
-
 local function cookTick()
     if not flags.autoCook then return end
     if (not cookActive) or (now() - cookLast > 0.6) then
@@ -753,10 +752,9 @@ end
 task.spawn(function() while true do pcall(seatAndOrderTick); task.wait(tuners.seatPeriod) end end)
 task.spawn(function() while true do pcall(serveTick);       task.wait(tuners.servePeriod) end end)
 task.spawn(function() while true do pcall(cookTick);        task.wait(tuners.cookPeriod) end end)
--- light janitor for workspace.Temp
 task.spawn(function() while task.wait(180) do if workspace:FindFirstChild("Temp") then workspace.Temp:ClearAllChildren() end end end)
 
--- Prime: start watching any tables already in-use when script loads
+-- Prime existing tables for housekeeping
 ensureTables()
 for _, tbl in ipairs(tableList) do
     local inUse = tbl:GetAttribute("InUse") == true
@@ -764,7 +762,6 @@ for _, tbl in ipairs(tableList) do
         watchTable(tbl)
     end
 end
--- Prime once so seating/orders don't wait a full tick
 pcall(seatAndOrderTick)
 scanFoodFolderOnce()
 
@@ -798,11 +795,10 @@ local function addSlider(where,label,min,max,default,cb)
     if where and type(where.Slider)=="function" then where:Slider(label,min,max,default,cb); return end
     if where and type(where.AddSlider)=="function" then where:AddSlider(label,min,max,default,cb); return end
 end
-
 task.defer(function()
     local UI = loadUILib()
     if not UI then return end
-    local win = mkWindow(UI, { Title="RT3 Helper (Event Housekeeping)", CFG="RT3_EVT_HK", Key=Enum.KeyCode.RightShift })
+    local win = mkWindow(UI, { Title="RT3 Helper (Resilient Serve)", CFG="RT3_RESERVE", Key=Enum.KeyCode.RightShift })
     if not win then return end
     local tab = (win.Tab and win:Tab("Automation")) or win
     local sec = (tab.Section and tab:Section("Main")) or tab
@@ -818,4 +814,4 @@ task.defer(function()
     addSlider(sec,"Cook tick (s)",0.10,1.00,tuners.cookPeriod,function(v) tuners.cookPeriod=tonumber(string.format("%.2f",v)) end)
 end)
 
-print("[RTHelper] loaded (event-driven housekeeping + perf + no-player-orders).")
+print("[RTHelper] loaded (resilient serving + event housekeeping + perf + no-player-orders).")
