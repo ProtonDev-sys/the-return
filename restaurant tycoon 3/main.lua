@@ -1,5 +1,5 @@
--- RTHelper (tray-aware serving + event housekeeping + ultra-perf)
--- Seat -> Take Orders -> Auto Cook (burst) -> Serve (single-hold; tray-confirm) -> Bills/Dishes (per-table ChildAdded hooks)
+-- RTHelper (tray-first FIFO serving + event housekeeping + ultra-perf)
+-- Seat -> Take Orders -> Auto Cook (burst) -> Serve (FIFO while tray present) -> Bills/Dishes (per-table ChildAdded hooks)
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -90,7 +90,7 @@ local tuners = {
     servePeriod  = 0.04,
     serveDelay   = 0.05,
     serveTimeout = 1.20,
-    holdGrace    = 0.70,  -- after grab, allow reparent jitter before housekeeping
+    holdGrace    = 0.70,
 }
 local ORDER_COOLDOWN = 0.5
 local SEAT_COOLDOWN  = 1.5
@@ -153,13 +153,10 @@ local function disconnectWatch(tbl)
     dprint("Unwatch", tbl and tbl.Name or "?")
 end
 
--- forward decl
-local isFoodPlate
-
 local function tryCollectDishes(tbl)
     if not flags.housekeeping then return end
     if tbl and tbl.Parent then
-        if _G.__RTH_carryingSince and (now() - _G.__RTH_carryingSince < tuners.holdGrace) and _G.__RTH_isHolding and _G.__RTH_isHolding() then
+        if _G.__RTH_isHolding and _G.__RTH_isHolding() and (now() - (_G.__RTH_carryingSince or 0) < tuners.holdGrace) then
             task.delay(0.25, function() tryCollectDishes(tbl) end)
             return
         end
@@ -171,7 +168,7 @@ local function tryCollectBill(tbl, bill)
     if not flags.housekeeping then return end
     if not (tbl and tbl.Parent and bill and bill.Parent==tbl) then return end
     if bill:GetAttribute("Taken") == true then return end
-    if _G.__RTH_carryingSince and (now() - _G.__RTH_carryingSince < tuners.holdGrace) and _G.__RTH_isHolding and _G.__RTH_isHolding() then
+    if _G.__RTH_isHolding and _G.__RTH_isHolding() and (now() - (_G.__RTH_carryingSince or 0) < tuners.holdGrace) then
         task.delay(0.25, function() tryCollectBill(tbl, bill) end)
         return
     end
@@ -310,31 +307,6 @@ local function isPlayerCustomer(gid,cid)
     return isPlayerishObject(char) or isPlayerishObject(char.Parent)
 end
 
--- ===== Desired dish (bounded) =====
-local dishNames  = { "DishId","Dish","FoodId","Food","RecipeId","MealId","ItemId","Order","OrderId","Wanted","Requested","FoodType","Meal" }
-local function readDesiredDishFromChar(char)
-    if not char then return nil end
-    for _, n in ipairs(dishNames) do
-        local v = char:GetAttribute(n)
-        if v ~= nil then return tostring(v) end
-    end
-    for _, ch in ipairs(char:GetChildren()) do
-        if ch:IsA("ValueBase") and nameIn(dishNames, ch.Name) then
-            local val = readIdValue(ch); if val then return val end
-        end
-    end
-    local n = 0
-    for _, d in ipairs(char:GetChildren()) do
-        n += 1; if n > 80 then break end
-        for _, g in ipairs(d:GetChildren()) do
-            if g:IsA("ValueBase") and nameIn(dishNames, g.Name) then
-                local val = readIdValue(g); if val then return val end
-            end
-        end
-    end
-    return nil
-end
-
 -- ===== Seat + Order =====
 local seatCD, seatPending, seatedOrQueued, orderCD = {}, {}, {}, {}
 local function bestTableFor(group)
@@ -406,104 +378,70 @@ local function seatAndOrderTick()
     enumerateCustomers()
 end
 
--- ===== Waiting & desires (skip players) =====
-local waitingIndex = {}               -- ["gid|cid"]=true
-local desiredFoodByCustomer = {}      -- ["gid|cid"]=dishId
-local waitingByFood = {}              -- [dishId]={ "gid|cid", ... }
+-- ===== Waiting queue (FIFO, NPC-only) =====
+local waiterQueue, inQueue = {}, {}   -- array queue of keys; set membership
+local waitingIndex = {}               -- key -> true
+
+local function queueFront()
+    while #waiterQueue > 0 do
+        local k = waiterQueue[1]
+        if waitingIndex[k] then return k end
+        -- stale -> drop
+        inQueue[k] = nil
+        table.remove(waiterQueue, 1)
+    end
+    return nil
+end
+local function queueDropKey(k)
+    if not k then return end
+    if waiterQueue[1] == k then
+        table.remove(waiterQueue, 1)
+    else
+        for i=#waiterQueue,1,-1 do
+            if waiterQueue[i] == k then table.remove(waiterQueue, i) break end
+        end
+    end
+    inQueue[k] = nil
+end
 
 local function pushWaitingForDish(gid, cid)
-    if isPlayerCustomer(gid,cid) then dprint("Skip player waiter", gid, cid); return end
-    local key = keyFor(gid,cid)
-    waitingIndex[key] = true
-    local char = getChar(gid,cid)
-    if not char then refreshCharIndex(); char = getChar(gid,cid) end
-    local dish = readDesiredDishFromChar(char)
-    if dish then
-        desiredFoodByCustomer[key] = tostring(dish)
-        waitingByFood[dish] = waitingByFood[dish] or {}
-        waitingByFood[dish][#waitingByFood[dish]+1] = key
-        dprint("Want", gid, cid, "dish", dish)
-    else
-        desiredFoodByCustomer[key] = nil
-        dprint("Want", gid, cid, "dish (unknown)")
+    if isPlayerCustomer(gid,cid) then return end
+    local k = keyFor(gid,cid)
+    if not waitingIndex[k] then
+        waitingIndex[k] = true
+        if not inQueue[k] then
+            inQueue[k] = true
+            waiterQueue[#waiterQueue+1] = k
+        end
     end
 end
 local function clearWaiting(gid, cid)
-    local key = keyFor(gid,cid)
-    waitingIndex[key] = nil
-    local dish = desiredFoodByCustomer[key]
-    if dish and waitingByFood[dish] then
-        for i=#waitingByFood[dish],1,-1 do
-            if waitingByFood[dish][i] == key then table.remove(waitingByFood[dish], i) end
-        end
-        if #waitingByFood[dish]==0 then waitingByFood[dish]=nil end
+    local k = keyFor(gid,cid)
+    if waitingIndex[k] then
+        waitingIndex[k] = nil
+        queueDropKey(k)
     end
-    desiredFoodByCustomer[key] = nil
 end
+
 if Customers.CustomerStateChanged then
     Customers.CustomerStateChanged:Connect(function(ty, gid, cid, _, state)
         if ty ~= Tycoon then return end
         gid, cid = toStringId(gid), toStringId(cid)
-        local k = keyFor(gid,cid)
         if state == CustomerState.WaitingForDish then
-            if not waitingIndex[k] then pushWaitingForDish(gid,cid) end
+            pushWaitingForDish(gid,cid)
         else
-            if waitingIndex[k] then clearWaiting(gid,cid) end
+            clearWaiting(gid,cid)
         end
     end)
 end
-local lastPrune = 0
-local function pruneWaitingIfNeeded()
-    if now() - (lastPrune or 0) < 3.0 then return end
-    lastPrune = now()
-    for k,_ in pairs(waitingIndex) do
-        local gid, cid = k:match("^(.-)|(.-)$")
-        if gid and cid then
-            if isPlayerCustomer(gid,cid) then
-                clearWaiting(gid,cid)
-            else
-                local ok, st = pcall(Customers.GetCustomerState, Customers, Tycoon, gid, cid)
-                if (not ok) or (st ~= CustomerState.WaitingForDish) then
-                    clearWaiting(gid,cid)
-                end
-            end
-        end
-    end
-end
 
--- ===== Plates =====
-function isFoodPlate(inst)
+-- ===== Plates (event-driven queue) =====
+local function isFoodPlate(inst)
     if not (typeof(inst)=="Instance" and inst:IsA("Model")) then return false end
     local n = tostring(inst.Name)
     if n:lower() == "trash" then return false end
     return n:match("^%d+$") ~= nil
 end
-local dishAttrNames = { "DishId","Dish","FoodId","Food","RecipeId","MealId","ItemId" }
-local plateDish = setmetatable({}, { __mode="k" })
-local function readDishIdFromPlate(plate)
-    local cached = plateDish[plate]
-    if cached ~= nil then return cached end
-    local id = tostring(plate.Name or "")
-    if id == "" or id:lower()=="trash" then id = nil end
-    if not id then
-        for _, n in ipairs(dishAttrNames) do
-            local v = plate:GetAttribute(n)
-            if v ~= nil then id = tostring(v) break end
-        end
-    end
-    plateDish[plate] = id
-    return id
-end
-local gidAttrNames = { "GroupId","GroupID","Group","GID" }
-local cidAttrNames = { "CustomerId","CustomerID","Customer","CID" }
-local function plateTargetIds(plate)
-    local gid, cid
-    for _, n in ipairs(gidAttrNames) do local v = plate:GetAttribute(n); if v ~= nil then gid = tostring(v) break end end
-    for _, n in ipairs(cidAttrNames) do local v = plate:GetAttribute(n); if v ~= nil then cid = tostring(v) break end end
-    if gid and cid then return gid, cid end
-    return nil, nil
-end
-
 local PlateQ, seenPlates = {}, {}
 local function qpush(q,v) q[#q+1] = v end
 local function qpop(q) if #q==0 then return nil end local v=q[1]; table.remove(q,1); return v end
@@ -511,80 +449,48 @@ local function recordPlate(plate)
     if not isFoodPlate(plate) or seenPlates[plate] then return end
     seenPlates[plate] = true
     qpush(PlateQ, plate)
-    readDishIdFromPlate(plate)
-    dprint("Plate +", plate.Name, "dish", plateDish[plate] or "?")
+    dprint("Plate +", plate.Name)
 end
 local function scanFoodFolderOnce() for _, ch in ipairs(FoodFolder:GetChildren()) do recordPlate(ch) end end
 FoodFolder.ChildAdded:Connect(recordPlate)
-FoodFolder.ChildRemoved:Connect(function(ch) seenPlates[ch] = nil; plateDish[ch] = nil end)
+FoodFolder.ChildRemoved:Connect(function(ch) seenPlates[ch] = nil end)
 
--- ===== Carry monitor (tray/plate in character) =====
+-- ===== Tray / carry detection =====
 do
-    local carry = { tray = nil }
     local function isTray(inst)
         return typeof(inst)=="Instance"
            and inst:IsA("Model")
            and inst.Name:lower():find("tray") ~= nil
     end
-    local function isCurrentlyHolding()
+    local function isHolding()
         local char = LocalPlayer.Character
         if not char then return false end
-        if carry.tray and carry.tray.Parent == char then return true end
-        if _G.__RTH_carryPlate and _G.__RTH_carryPlate.Parent and _G.__RTH_carryPlate:IsDescendantOf(char) then
-            return true
-        end
         for _, ch in ipairs(char:GetChildren()) do
             if isTray(ch) then return true end
         end
         return false
     end
-    _G.__RTH_isHolding = isCurrentlyHolding
-
-    local function hookTray(tray)
-        carry.tray = tray
-        tray.ChildAdded:Connect(function(ch)
-            if isFoodPlate(ch) then
-                _G.__RTH_carryPlate = ch
-                _G.__RTH_carryingSince = now()
-            end
-        end)
-        tray.ChildRemoved:Connect(function(ch)
-            if ch == _G.__RTH_carryPlate then
-                _G.__RTH_carryPlate = nil
-                _G.__RTH_carryingSince = nil
-            end
-        end)
-    end
+    _G.__RTH_isHolding = isHolding
 
     local function hookCharacter(char)
         char.ChildAdded:Connect(function(ch)
-            if isTray(ch) then hookTray(ch) end
-            if isFoodPlate(ch) then
-                _G.__RTH_carryPlate = ch
-                _G.__RTH_carryingSince = now()
-            end
+            if isTray(ch) then _G.__RTH_carryingSince = now() end
+            if isFoodPlate(ch) then _G.__RTH_carryingSince = now() end
         end)
         char.ChildRemoved:Connect(function(ch)
-            if carry.tray and ch == carry.tray then carry.tray = nil end
-            if ch == _G.__RTH_carryPlate then
-                _G.__RTH_carryPlate = nil
-                _G.__RTH_carryingSince = nil
-            end
+            -- if tray/plate leaves, carryingSince resets naturally in serve flow
         end)
-        for _, ch in ipairs(char:GetChildren()) do
-            if isTray(ch) then hookTray(ch) end
-        end
     end
-
     if Players.LocalPlayer.Character then hookCharacter(Players.LocalPlayer.Character) end
     Players.LocalPlayer.CharacterAdded:Connect(hookCharacter)
 end
 
--- ===== Serve (tray-aware confirmation + unstick watchdog) =====
-local carryingPlate, carrySince = nil, 0
+-- ===== Serve (FIFO while tray present) =====
+local carryingPlate = nil      -- last grabbed plate instance (optional)
+local currentTargetKey = nil   -- key we insist on while tray exists
 
 local function serveConfirm(gid, cid, plate)
-    -- success = plate not in our character anymore (or destroyed)
+    -- success = plate left our character, or engine removed tray
     local deadline = now() + tuners.serveTimeout
     while now() < deadline do
         TaskCompleted:FireServer({
@@ -594,11 +500,11 @@ local function serveConfirm(gid, cid, plate)
             FoodModel  = plate,
             CustomerId = cid
         })
-        local miniEnd = now() + tuners.serveDelay
-        while now() < miniEnd do
+        local waitUntil = now() + tuners.serveDelay
+        while now() < waitUntil do
             task.wait(0.02)
-            if not plate or not plate.Parent then return true end
             local char = LocalPlayer.Character
+            if not plate or not plate.Parent then return true end
             if char and not plate:IsDescendantOf(char) then return true end
             if _G.__RTH_isHolding and (not _G.__RTH_isHolding()) then return true end
         end
@@ -609,173 +515,65 @@ local function serveConfirm(gid, cid, plate)
     return false
 end
 
-local function chooseTargetsForDish(dishId)
-    local targets, seen = {}, {}
-    local list = dishId and waitingByFood[dishId] or nil
-    if list and #list > 0 then
-        for _, k in ipairs(list) do
-            if waitingIndex[k] then
-                local gid, cid = k:match("^(.-)|(.-)$")
-                if gid and cid and (not isPlayerCustomer(gid,cid)) then
-                    if not seen[k] then
-                        targets[#targets+1] = {gid=gid, cid=cid, key=k}
-                        seen[k] = true
-                    end
-                end
-            end
-        end
-    end
-    if #targets == 0 then
-        for k,_ in pairs(waitingIndex) do
-            local gid, cid = k:match("^(.-)|(.-)$")
-            if gid and cid and (not isPlayerCustomer(gid,cid)) and not seen[k] then
-                targets[#targets+1] = {gid=gid, cid=cid, key=k}
-                seen[k] = true
-            end
-        end
-    end
-    return targets
-end
-
-local function pickBestPlate()
-    for i=1,#PlateQ do
-        local p = PlateQ[i]
-        if p and p.Parent and p:IsDescendantOf(FoodFolder) then
-            local did = readDishIdFromPlate(p)
-            local t = chooseTargetsForDish(did)
-            if #t > 0 then
-                table.remove(PlateQ, i)
-                return p, did, t
-            end
-            local gid, cid = plateTargetIds(p)
-            if gid and cid and (not isPlayerCustomer(gid,cid)) then
-                table.remove(PlateQ, i)
-                return p, did, { {gid=gid, cid=cid, key=keyFor(gid,cid)} }
-            end
-        end
-    end
-    return nil, nil, nil
-end
-
-local function buildTargetOrderForPlate(plate)
-    local targets, seen = {}, {}
-
-    local mgid, mcid = plateTargetIds(plate)
-    if mgid and mcid and (not isPlayerCustomer(mgid,mcid)) then
-        local k = keyFor(mgid,mcid)
-        targets[#targets+1] = {gid=mgid, cid=mcid, key=k}
-        seen[k] = true
-    end
-
-    local did = readDishIdFromPlate(plate)
-    local dishTargets = chooseTargetsForDish(did)
-    for _,t in ipairs(dishTargets) do
-        local kk = t.key or keyFor(t.gid,t.cid)
-        if not seen[kk] then
-            targets[#targets+1] = t
-            seen[kk] = true
-        end
-    end
-
-    if #targets == 0 then
-        targets = dishTargets
-    end
-    return targets, did
-end
-
 local function serveTick()
     if not flags.autoServe then return end
-    pruneWaitingIfNeeded()
 
-    if carryingPlate and (not carryingPlate.Parent) then
-        carryingPlate, carrySince = nil, 0
-        _G.__RTH_carryPlate = nil
-        _G.__RTH_carryingSince = nil
-    end
+    local hasTray = _G.__RTH_isHolding and _G.__RTH_isHolding()
 
-    if carryingPlate then
-        local targets = buildTargetOrderForPlate(carryingPlate)
-        local served = false
-        for _, t in ipairs(targets) do
-            served = serveConfirm(t.gid, t.cid, carryingPlate)
-            if served then clearWaiting(t.gid, t.cid) break end
+    -- If tray present: ONLY try to serve the head of the queue until tray disappears
+    if hasTray then
+        if not currentTargetKey then
+            currentTargetKey = queueFront()
         end
-        if served then
-            dprint("Served ✓ (retry)")
-            carryingPlate, carrySince = nil, 0
-            _G.__RTH_carryPlate = nil
-            _G.__RTH_carryingSince = nil
-        else
-            -- Unstick watchdog: every few seconds, sweep all waiters (even if dish mismatch),
-            -- because sometimes plate mapping/desire metadata is stale.
-            local STUCK_SOFT = 4.0
-            local STUCK_HARD = 9.0
-            if _G.__RTH_carryingSince then
-                local held = now() - _G.__RTH_carryingSince
-                if held > STUCK_SOFT then
-                    for k,_ in pairs(waitingIndex) do
-                        local gid, cid = k:match("^(.-)|(.-)$")
-                        if gid and cid and (not isPlayerCustomer(gid,cid)) then
-                            if serveConfirm(gid, cid, carryingPlate) then
-                                clearWaiting(gid, cid)
-                                served = true
-                                break
-                            end
-                        end
-                    end
-                end
-                if (not served) and held > STUCK_HARD then
-                    -- Last resort: try any mapped target on plate again, then clear local carry if engine detached.
-                    local mg, mc = plateTargetIds(carryingPlate)
-                    if mg and mc then
-                        served = serveConfirm(mg, mc, carryingPlate)
-                    end
-                    if served or (not carryingPlate.Parent) or (LocalPlayer.Character and not carryingPlate:IsDescendantOf(LocalPlayer.Character)) then
-                        served = true
-                    end
-                end
-            end
-            if served then
-                dprint("Served ✓ (unstick)")
-                carryingPlate, carrySince = nil, 0
-                _G.__RTH_carryPlate = nil
-                _G.__RTH_carryingSince = nil
-            else
-                dprint("Hold plate; will retry")
-            end
+        if not currentTargetKey then
+            -- nothing to give; just wait for tray to clear (game state) to avoid picking anything new
+            return
+        end
+        local gid, cid = currentTargetKey:match("^(.-)|(.-)$")
+        if not gid or not cid or not waitingIndex[currentTargetKey] then
+            -- stale -> get a fresh head
+            queueDropKey(currentTargetKey)
+            currentTargetKey = nil
+            return
+        end
+        -- Try to serve ONLY this customer
+        local ok = serveConfirm(gid, cid, carryingPlate)
+        if ok then
+            clearWaiting(gid, cid)
+            if waiterQueue[1] == currentTargetKey then table.remove(waiterQueue, 1) end
+            inQueue[currentTargetKey] = nil
+            currentTargetKey = nil
+            carryingPlate = nil
         end
         return
     end
 
+    -- No tray present -> acquire next plate (only if we have someone to serve)
+    currentTargetKey = currentTargetKey or queueFront()
+    if not currentTargetKey then return end
     if #PlateQ == 0 then scanFoodFolderOnce() end
-    local plate, _, initialTargets = pickBestPlate()
-    if not plate then return end
-    if not (plate.Parent and plate:IsDescendantOf(FoodFolder)) then return end
-    if not initialTargets or #initialTargets == 0 then qpush(PlateQ, plate); return end
+    local plate = qpop(PlateQ)
+    if not plate or not plate.Parent or not plate:IsDescendantOf(FoodFolder) then return end
 
     local okGrab = pcall(function() GrabFoodRF:InvokeServer(plate) end)
     if not okGrab then
-        dprint("Grab failed; requeue")
         if plate.Parent and plate:IsDescendantOf(FoodFolder) then qpush(PlateQ, plate) end
         return
     end
-    carryingPlate, carrySince = plate, now()
-    _G.__RTH_carryPlate = plate
-    _G.__RTH_carryingSince = carrySince
+    carryingPlate = plate
+    _G.__RTH_carryingSince = now()
 
-    local targets = buildTargetOrderForPlate(plate)
-    local served = false
-    for _, tgt in ipairs(targets) do
-        served = serveConfirm(tgt.gid, tgt.cid, plate)
-        if served then clearWaiting(tgt.gid, tgt.cid); break end
-    end
-    if served then
-        dprint("Served ✓ (immediate)")
-        carryingPlate, carrySince = nil, 0
-        _G.__RTH_carryPlate = nil
-        _G.__RTH_carryingSince = nil
-    else
-        dprint("Immediate serve failed; will retry while holding")
+    -- Immediately try to serve the head of the queue
+    local gid, cid = currentTargetKey:match("^(.-)|(.-)$")
+    if gid and cid and waitingIndex[currentTargetKey] then
+        local ok = serveConfirm(gid, cid, plate)
+        if ok then
+            clearWaiting(gid, cid)
+            if waiterQueue[1] == currentTargetKey then table.remove(waiterQueue, 1) end
+            inQueue[currentTargetKey] = nil
+            currentTargetKey = nil
+            carryingPlate = nil
+        end
     end
 end
 
@@ -862,7 +660,7 @@ task.spawn(function() while true do pcall(serveTick);       task.wait(tuners.ser
 task.spawn(function() while true do pcall(cookTick);        task.wait(tuners.cookPeriod) end end)
 task.spawn(function() while task.wait(180) do local t=workspace:FindFirstChild("Temp"); if t then t:ClearAllChildren() end end end)
 
--- Prime existing tables for housekeeping
+-- Prime housekeeping on existing tables
 ensureTables()
 for _, tbl in ipairs(tableList) do
     local inUse = tbl:GetAttribute("InUse") == true
@@ -903,16 +701,16 @@ end
 task.defer(function()
     local UI = loadUILib()
     if not UI then return end
-    local win = mkWindow(UI, { Title="RT3 Helper", CFG="RT3_TRAY_PERF", Key=Enum.KeyCode.RightShift })
+    local win = mkWindow(UI, { Title="RT3 Helper (FIFO Tray)", CFG="RT3_FIFO_TRAY", Key=Enum.KeyCode.RightShift })
     if not win then return end
     local tab = (win.Tab and win:Tab("Automation")) or win
     local sec = (tab.Section and tab:Section("Main")) or tab
 
     addToggle(sec,"Auto Seat + Order",true,function(v) flags.autoSeatOrder=v end)
-    addToggle(sec,"Auto Serve",true,function(v) flags.autoServe=v end)
+    addToggle(sec,"Auto Serve (FIFO)",true,function(v) flags.autoServe=v end)
     addToggle(sec,"Auto Cook (burst)",true,function(v) flags.autoCook=v end)
-    addToggle(sec,"Bills + Dishes (event-driven)",true,function(v) flags.housekeeping=v end)
+    addToggle(sec,"Bills + Dishes (event)",true,function(v) flags.housekeeping=v end)
     addToggle(sec,"Anti-AFK",true,function(v) flags.antiAFK=v end)
 end)
 
-print("[RTHelper] loaded (tray-aware serving + event housekeeping + perf + no-player-orders).")
+print("[RTHelper] loaded (FIFO tray serving + event housekeeping + perf).")
